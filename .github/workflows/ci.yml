@@ -384,13 +384,14 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          paths=(Dockerfile .dockerignore docker-compose.yml package.json pnpm-lock.yaml pnpm-workspace.yaml packages scripts .github/workflows/ci.yml)
-          if git diff --quiet "$base" "$GITHUB_SHA" -- "${paths[@]}"; then
+          # The builder stage copies the whole context (`COPY . .`), so almost any
+          # file is an image input. Skip only when every changed file is docs.
+          changed="$(git diff --name-only "$base" "$GITHUB_SHA")"
+          if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -qvE '(^docs/|\.md$)'; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No main-image inputs changed; skipping the image build."
+            echo "Only documentation changed; skipping the image build."
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            git --no-pager diff --stat "$base" "$GITHUB_SHA" -- "${paths[@]}"
           fi
 
       - name: Set up Buildx
