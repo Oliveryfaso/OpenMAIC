@@ -1,4 +1,4 @@
-import { access, mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -71,6 +71,73 @@ it.each(['failed', 'succeeded'] as const)(
       expect(await artifacts.store.locate(id)).toMatchObject({ path: join(dir, 'output.mp4') });
   },
 );
+
+it.each([
+  ['confirmed cleanup', true, true, false],
+  ['unconfirmed cleanup', false, false, true],
+] as const)(
+  'preserves a committed publication across late cancellation with %s',
+  async (_label, cleanupVerified, reservationReturned, admissionClosed) => {
+    const jobs = createMemoryJobStore();
+    const artifacts = createMemoryArtifactStore();
+    let accepting = true;
+    let started!: () => void;
+    const publicationReady = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let settle!: () => void;
+    const resources: RenderResourceSettlement = {
+      published: true,
+      cleanupVerified,
+      reservationReturned,
+      admissionClosed,
+      details: { publication: { directoryFsync: true } },
+    };
+    const executor: RenderExecutor = {
+      accepting: () => accepting,
+      async execute(request) {
+        await writeFile(request.outputPath, 'published-after-cancel');
+        started();
+        return new Promise<RenderExecutionResult>((resolve) => {
+          settle = () => {
+            if (admissionClosed) accepting = false;
+            resolve({ status: 'succeeded', resources });
+          };
+        });
+      },
+    };
+    const coordinator = new RenderCoordinator(executor, jobs, artifacts.store, {
+      onEvent: () => {},
+    });
+    const dir = await directory();
+    const id = await coordinator.submit(coordinator.reserve('late-resource'), dir, options);
+    await publicationReady;
+
+    expect(await coordinator.cancel(id)).toBe(true);
+    settle();
+
+    const job = await finish(jobs, id);
+    expect(job).toMatchObject({ status: 'succeeded', resources });
+    expect(await artifacts.store.locate(id)).toEqual({
+      kind: 'file',
+      path: join(dir, 'output.mp4'),
+    });
+    await expect(readFile(join(dir, 'output.mp4'), 'utf8')).resolves.toBe(
+      'published-after-cancel',
+    );
+
+    if (admissionClosed) {
+      await coordinator.cleanupProject(dir);
+      await expect(access(dir)).resolves.toBeUndefined();
+      await expect(readFile(join(dir, 'output.mp4'), 'utf8')).resolves.toBe(
+        'published-after-cancel',
+      );
+      expect(coordinator.accepting).toBe(false);
+      expect(() => coordinator.reserve('blocked-after-quarantine')).toThrow('resource owner');
+    }
+  },
+);
+
 it('rejects a queued job without launching when the owner becomes unavailable', async () => {
   const jobs = createMemoryJobStore();
   const artifacts = createMemoryArtifactStore();

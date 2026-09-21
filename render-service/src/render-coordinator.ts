@@ -391,7 +391,12 @@ export class RenderCoordinator {
         return;
       }
 
-      if (abort.signal.aborted) {
+      // A resource executor publishes before returning its terminal result. A
+      // cancellation can arrive while that result is in IPC transit; once the
+      // atomic publication is explicit, it is the winning commit decision and
+      // must not be relabelled or deleted. Executors without that settlement
+      // keep the existing cancellation behavior.
+      if (abort.signal.aborted && result.resources?.published !== true) {
         await this.finishNonSuccess(id, projectDir, {
           status: 'cancelled',
           failure: { code: 'cancelled', message: 'Render cancelled' },

@@ -173,6 +173,23 @@ that untrusted page contained:
 (and keep the egress lockdown on, or accept the risk with the toggle) — it needs
 no outbound access.
 
+### Residual risk
+
+The injected CSP plus request interception close script, fetch/XHR, WebSocket,
+image, frame and form egress from the untrusted documents. Two channels remain:
+
+- **Top-level navigation on `/render`.** `location`, a `<meta http-equiv=refresh>`,
+  `window.open` and `target=_top` can replace the top frame; CSP has no
+  `navigate-to` directive, and the producer's browser exposes no request
+  interception we can install. The service therefore relies on the container's
+  egress lockdown: with `RENDER_EGRESS_LOCKDOWN=false`, a rendered page can
+  navigate to any reachable address and the result appears in the output video.
+  Do not run standalone with the lockdown disabled.
+- **Declarative subresources inside a framed SVG/XHTML.** Sanitizing removes
+  script and event handlers, but a surviving `<image href>` (or CSS `url()`)
+  can still load a subresource through a framed document that has no CSP of its
+  own. The lockdown is what blocks that egress in supported deployments.
+
 ## Run
 
 ### Docker (recommended)
@@ -275,13 +292,80 @@ result for an idempotent retry. The default remains the in-process executor.
 
 ### Experimental per-task resource budgets
 
-The opt-in resource executor combines Producer CPU/memory admission with native
-per-task hard limits and verified reservation/artifact settlement. It is
-maintained as an OpenMAIC-owned fixed source patch, consumed through the existing
-`RenderExecutor` seam. See [dependency delivery, startup and validation limits](producer-patch/README.md).
-The standard service and Docker entrypoint keep their current dependency and
-privilege model. The shipped Docker image does not support `start:resources`;
-use the separately provisioned Linux installation described above.
+The opt-in resource executor keeps `RenderCoordinator` as the service's only
+admission and queue owner. A dedicated root process starts each admitted render
+as a transient systemd service before that task imports the official, unmodified
+`@hyperframes/producer` 0.8.37 package. The unit applies the task CPU, memory,
+swap and PID limits to the worker and all Chrome/FFmpeg descendants.
+
+Inside the unit's mount namespace, a private tmpfs supplies `HOME`, `TMPDIR` and
+the render candidate, while the extracted project is mounted read-only. After
+the business worker and descendants drain, the control process copies and
+fsyncs the candidate to a unique staging file on the output filesystem. Before
+that transfer it performs a bounded host-procfs scan for external FD, mmap,
+cwd, root or executable references to the private filesystem; a detected
+reference or unreadable evidence fails closed. The root owner publishes the
+staging file with an atomic rename only after ordinary unmount and systemd
+cgroup removal are both confirmed. Publication and cleanup
+settlement remain separate: an unconfirmed cleanup closes admission and cannot
+report the reservation returned. Before the task runner exits and systemd can
+remove its cgroup, it separately captures `memory.current`, `memory.events`,
+`memory.events.local`, `cpu.stat`, `pids.current`, and `pids.events`. Missing or
+unreadable counters are reported as an accounting collection failure; they do
+not fabricate measurements or change a confirmed cleanup into an unconfirmed
+one.
+
+Start this mode with `npm run start:resources -- /etc/openmaic/resource.json`;
+[`resource-config.example.json`](resource-config.example.json) documents the
+root-owned state directory, fixed tool paths and per-task budget. Provision the
+official alias from the lockfile with browser download disabled when a managed
+browser is already installed (for example, `PUPPETEER_SKIP_DOWNLOAD=true npm ci`).
+The config file, state directory, browser, FFmpeg and installed service code are
+trusted deployment inputs and must not be writable by the HTTP worker. Each
+project directory must be exclusively owned by that worker for the duration of
+its render. Because the setuid worker receives absolute paths below the state
+root, that root must be mode `0711` (root-owned and non-writable): other-execute
+permits traversal only, while UUID task directories are also `0711` and their
+request/result files remain root-private `0600`. The dedicated state directory
+must be empty at first startup. An
+owner crash intentionally leaves its lock and/or task directory behind, so a
+restart refuses admission until the platform cleanup is independently audited.
+The reference check assumes readable host procfs, a trusted privileged platform
+and exclusive ownership of the configured roots; it is not protection against
+a privileged process racing the bounded scan.
+
+The standard service and Docker entrypoint keep their current startup and
+privilege model, but the install graph is not byte-for-byte unchanged: it adds
+the official Producer 0.8.37 alias, and shared transitive versions such as
+Puppeteer follow `package-lock.json`. The alias's own HyperFrames transitive
+packages are lockfile-resolved and are not all version 0.8.37. The shipped
+Docker image does not support `start:resources`; use a separately provisioned
+Linux host with systemd, cgroup v2, mount namespaces, `mount`/`umount`, and
+`setpriv`.
+
+This profile is qualified for one render-service instance with one fixed
+per-task budget and one active execution slot. The state-root lock prevents a
+second owner from sharing that root, but instances using different roots do not
+coordinate capacity and can oversubscribe the same host. At startup the one
+instance rejects a budget larger than its effective CPU or memory capacity; the
+coordinator's queue and per-identity slots remain request admission controls,
+not a second resource ledger. The owner treats that fixed budget as reusable
+only after descendant drain, mount cleanup and task-cgroup removal are
+confirmed. Any unverifiable cleanup quarantines the project and state, keeps
+the settlement unreturned and closes admission. While running, the owner also
+samples the shared systemd slice and its memory ancestors: a local `high`, `max`
+or `oom` event, an active `memory.high`, or unreadable/reset evidence closes
+admission until an operator audits and restarts the owner.
+
+Fixed-input Linux evidence on Ubuntu 22.04 x86_64 with Node 22.23.2, systemd
+249 and cgroup v2 covers consecutive renders under one owner, cancellation and
+deadline cleanup with same-owner recovery, supervisor-death takeover,
+audio/video temporary paths, external FD/mmap rejection, task OOM enforcement,
+dynamic ancestor-memory pressure, descendant drain, cross-filesystem staging,
+ordinary unmount and publish ordering. The inputs and results are retained
+outside the product repository. These checks qualify the outer execution path
+on that tested platform and workload; they are not a claim that every
+deployment or media composition has been accepted.
 Resource-mode progress stays at `preparing` until the terminal result; intermediate
 frame counts and capture metrics are not reported. Do not interpret unchanged
 progress alone as a hung job; the configured deadline still applies.

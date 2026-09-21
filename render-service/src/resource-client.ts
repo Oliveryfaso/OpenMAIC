@@ -10,6 +10,13 @@ import type {
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
+const resourceDiagnosticCodes = new Set([
+  'main_pid_fields_not_ready',
+  'main_pid_startup_transient',
+  'main_pid_process_exited',
+  'main_pid_read_error',
+  'main_pid_identity_mismatch',
+]);
 function settlement(value: unknown): value is RenderResourceSettlement {
   return (
     record(value) &&
@@ -17,6 +24,9 @@ function settlement(value: unknown): value is RenderResourceSettlement {
       (key) => typeof value[key] === 'boolean',
     ) &&
     (typeof value.published === 'boolean' || value.published === 'unknown') &&
+    (value.diagnosticCode === undefined ||
+      (typeof value.diagnosticCode === 'string' &&
+        resourceDiagnosticCodes.has(value.diagnosticCode))) &&
     record(value.details)
   );
 }
@@ -30,7 +40,7 @@ function result(value: unknown): value is RenderExecutionResult {
         ['deadline_exceeded', 'execution_failed'].includes(String(value.failure.code));
 }
 
-/** Transport to the existing dedicated S owner; no resource ledger lives here. */
+/** Transport to the dedicated root resource owner; no resource ledger lives here. */
 export class ResourceClient implements RenderExecutor {
   private available = false;
   private terminal = false;
@@ -121,8 +131,9 @@ export class ResourceClient implements RenderExecutor {
         details: { ownerLost: true },
       },
     });
-    // Closing the inherited lifeline makes S close its Producer; G independently
-    // watches S and the task deadline. Never claim that a transport timeout drained A.
+    // Closing the inherited lifeline makes the owner stop admitting work. The
+    // systemd task remains independently bounded; never claim that a transport
+    // timeout drained it or returned its reservation.
     if (this.child.connected) this.child.disconnect();
   }
 

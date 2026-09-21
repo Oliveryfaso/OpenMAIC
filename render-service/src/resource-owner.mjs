@@ -1,42 +1,90 @@
-// Dedicated root S. The HTTP process drops privileges after this owner is ready.
-import { readFileSync, realpathSync, lstatSync } from 'node:fs';
+// Dedicated root resource owner. Admission stays in RenderCoordinator; this
+// process owns only the active task's platform boundary and settlement.
+import { lstatSync, realpathSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { createAncestorPressureMonitor } from './resource-ancestor-pressure.mjs';
+import { runResourceTask } from './resource-systemd-runner.mjs';
 import { readResourceSettings } from './resource-settings.mjs';
-import { verifyResourcePackage } from '../scripts/resource-package.mjs';
 
-/** The same request handler used by S; native ownership stays in Producer. */
+function notAdmitted() {
+  return {
+    published: false,
+    cleanupVerified: true,
+    reservationReturned: true,
+    admissionClosed: false,
+    details: { notAdmitted: true },
+  };
+}
+
+function validOptions(options) {
+  return (
+    options &&
+    typeof options === 'object' &&
+    Number.isSafeInteger(options.fps) &&
+    options.fps > 0 &&
+    options.fps <= 120 &&
+    ['draft', 'standard', 'high'].includes(options.quality) &&
+    options.format === 'mp4'
+  );
+}
+
+/** IPC request handling is exported so lifecycle/settlement can be tested locally. */
 export function createResourceHandler({
-  producer,
+  taskRunner,
   settings,
-  createRenderRequest,
-  BudgetedRenderError,
   send,
   close,
+  admissionGuard = () => true,
 }) {
   const projectRoot = realpathSync(settings.projectRoot);
   let active;
-  return async (message) => {
+  let admissionClosed = false;
+  const closeAdmission = () => {
+    if (admissionClosed) return;
+    admissionClosed = true;
+    send({ event: 'closed' });
+  };
+  const handle = async (message) => {
     if (!message || typeof message !== 'object') return;
     if (message.event === 'cancel') {
       if (active?.id === message.id) active.abort.abort();
       return;
     }
     if (message.event !== 'render' || active || typeof message.id !== 'string') {
+      closeAdmission();
       await close();
       return;
     }
+    if (!admissionGuard()) {
+      closeAdmission();
+      send({
+        event: 'result',
+        id: message.id,
+        result: {
+          status: 'failed',
+          failure: { code: 'execution_failed', message: 'Resource owner is unavailable' },
+          resources: { ...notAdmitted(), admissionClosed: true },
+        },
+      });
+      return;
+    }
     const abort = new AbortController();
-    active = { id: message.id, abort };
-    let result;
-    let deadlineNs;
+    let resolveDone;
+    const done = new Promise((resolveDonePromise) => {
+      resolveDone = resolveDonePromise;
+    });
+    active = { id: message.id, abort, done };
+    let outcome;
     let invoked = false;
     try {
       if (Buffer.byteLength(JSON.stringify(message)) > 1024 * 1024)
         throw new Error('Oversized resource request');
       if (typeof message.deadlineNs !== 'string' || !/^\d+$/.test(message.deadlineNs))
         throw new Error('Missing monotonic deadline');
-      deadlineNs = BigInt(message.deadlineNs);
+      if (!Number.isSafeInteger(message.timeoutMs) || message.timeoutMs <= 0)
+        throw new Error('Invalid task timeout');
+      if (!validOptions(message.options)) throw new Error('Invalid render options');
       const project = realpathSync(message.projectDir);
       if (
         project !== message.projectDir ||
@@ -46,92 +94,106 @@ export function createResourceHandler({
         resolve(message.outputPath) !== message.outputPath
       )
         throw new Error('Project/output is outside the service-owned request boundary');
-      const request = createRenderRequest({
-        projectDir: project,
-        outputPath: message.outputPath,
-        options: {
-          fps: { num: message.options.fps, den: 1 },
-          quality: message.options.quality,
-          format: 'mp4',
-          workers: 1,
-        },
-      });
       const remaining = Math.min(
         message.timeoutMs,
-        Number((deadlineNs - process.hrtime.bigint()) / 1_000_000n),
+        Number((BigInt(message.deadlineNs) - process.hrtime.bigint()) / 1_000_000n),
       );
       if (!Number.isSafeInteger(remaining) || remaining <= 0)
         throw new Error('render_deadline_exceeded');
       invoked = true;
-      const value = await producer.render(request, settings.task, {
-        timeoutMs: remaining,
-        signal: abort.signal,
-      });
-      result = {
-        status: 'succeeded',
-        resources: {
-          published: true,
-          cleanupVerified: value.reservationReturned,
-          reservationReturned: value.reservationReturned,
-          admissionClosed: producer.status().closed,
-          details: value,
-        },
-      };
+      outcome = await taskRunner(
+        settings,
+        { ...message, projectDir: project, timeoutMs: remaining },
+        abort.signal,
+      );
+      if (outcome.admissionClosed) admissionClosed = true;
+      if (!admissionGuard()) closeAdmission();
     } catch (error) {
       console.error('Resource render failed:', error);
-      const details =
-        error instanceof BudgetedRenderError
-          ? error.settlement
-          : invoked
-            ? { unexpectedFailure: true }
-            : {
-                published: false,
-                cleanupVerified: true,
-                reservationReturned: true,
-                notAdmitted: true,
-              };
-      const cancelled = abort.signal.aborted;
-      const expired = deadlineNs !== undefined && process.hrtime.bigint() >= deadlineNs;
-      result = {
-        status: cancelled ? 'cancelled' : 'failed',
-        failure: {
-          code: cancelled ? 'cancelled' : expired ? 'deadline_exceeded' : 'execution_failed',
-          message: cancelled
-            ? 'Render cancelled'
-            : expired
-              ? 'Render exceeded the deadline'
-              : 'Resource render failed; see service logs',
-        },
-        resources: {
-          published: details.published === true,
-          cleanupVerified: details.cleanupVerified === true,
-          reservationReturned: details.reservationReturned === true,
-          admissionClosed:
-            producer.status().closed || (invoked && !(error instanceof BudgetedRenderError)),
-          details,
-        },
-      };
+      const expired = /^\d+$/.test(String(message.deadlineNs ?? ''))
+        ? process.hrtime.bigint() >= BigInt(message.deadlineNs)
+        : false;
+      outcome = invoked
+        ? {
+            status: abort.signal.aborted ? 'cancelled' : 'failed',
+            failureCode: abort.signal.aborted
+              ? 'cancelled'
+              : expired
+                ? 'deadline_exceeded'
+                : 'execution_failed',
+            published: false,
+            cleanupVerified: false,
+            reservationReturned: false,
+            admissionClosed: true,
+            details: { unexpectedOwnerFailure: true },
+          }
+        : {
+            status: 'failed',
+            failureCode: expired ? 'deadline_exceeded' : 'execution_failed',
+            ...notAdmitted(),
+          };
+      if (invoked) admissionClosed = true;
     }
+    const cancelled = outcome.status === 'cancelled' || abort.signal.aborted;
+    const status = outcome.status === 'succeeded' ? 'succeeded' : cancelled ? 'cancelled' : 'failed';
+    const result = {
+      status,
+      ...(status === 'succeeded'
+        ? {}
+        : {
+            failure: {
+              code:
+                status === 'cancelled'
+                  ? 'cancelled'
+                  : outcome.failureCode === 'deadline_exceeded'
+                    ? 'deadline_exceeded'
+                    : 'execution_failed',
+              message:
+                status === 'cancelled'
+                  ? 'Render cancelled'
+                  : outcome.failureCode === 'deadline_exceeded'
+                    ? 'Render exceeded the deadline'
+                    : 'Resource render failed; see service logs',
+            },
+          }),
+      resources: {
+        published: outcome.published === true,
+        cleanupVerified: outcome.cleanupVerified === true,
+        reservationReturned: outcome.reservationReturned === true,
+        admissionClosed: admissionClosed || outcome.admissionClosed === true,
+        ...(typeof outcome.diagnosticCode === 'string'
+          ? { diagnosticCode: outcome.diagnosticCode }
+          : {}),
+        details: outcome.details ?? {},
+      },
+    };
     active = undefined;
+    resolveDone();
     send({ event: 'result', id: message.id, result });
   };
+  return Object.assign(handle, {
+    accepting: () => !admissionClosed,
+    closeAdmission,
+    async shutdown() {
+      admissionClosed = true;
+      if (active) {
+        active.abort.abort();
+        await active.done;
+      }
+    },
+  });
 }
 
 async function main() {
   if (process.platform !== 'linux' || process.getuid() !== 0 || !process.send)
     throw new Error('Resource owner requires Linux root and inherited IPC');
   const settings = readResourceSettings(process.argv[2]);
-  const packageRoot = verifyResourcePackage(settings.packageRoot);
-  const manifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
-  if (manifest.name !== '@hyperframes/producer' || manifest.version !== '0.8.37')
-    throw new Error('Expected the fixed patched Producer 0.8.37');
-  const { createBudgetedProducer, BudgetedRenderError } = await import(
-    pathToFileURL(join(packageRoot, 'dist/resources.js')).href
-  );
-  const { createRenderRequest } = await import(
-    pathToFileURL(join(packageRoot, 'dist/index.js')).href
-  );
-  const producer = createBudgetedProducer({ ...settings.owner, maxActive: 1, maxQueued: 0 });
+  const pressure = createAncestorPressureMonitor();
+  if (!pressure.check()) throw new Error('Cannot verify ancestor pressure at owner startup');
+  const runtimeSettings = {
+    ...settings,
+    owner: { ...settings.owner, taskSlice: pressure.taskSlice },
+  };
   let closing = false;
   const send = (value) => {
     if (process.connected)
@@ -139,43 +201,36 @@ async function main() {
         if (error) void close();
       });
   };
-  const statusTimer = setInterval(() => {
-    if (producer.status().closed) {
-      send({ event: 'closed' });
-      clearInterval(statusTimer);
-    }
-  }, 100).unref();
+  let handle;
   async function close() {
     if (closing) return;
     closing = true;
-    clearInterval(statusTimer);
     try {
-      await producer.close();
+      pressure.stop();
+      await handle?.shutdown();
+      rmSync(join(settings.stateRoot, 'owner.lock'), { recursive: true });
       process.exit(0);
     } catch (error) {
       console.error(error);
       process.exit(1);
     }
   }
+  handle = createResourceHandler({
+    taskRunner: runResourceTask,
+    settings: runtimeSettings,
+    send,
+    close,
+    admissionGuard: pressure.check,
+  });
+  pressure.start(() => handle.closeAdmission());
   process.once('disconnect', () => void close());
   process.once('SIGTERM', () => void close());
   process.once('SIGINT', () => void close());
-  const handle = createResourceHandler({
-    producer,
-    settings,
-    createRenderRequest,
-    BudgetedRenderError,
-    send,
-    close,
-  });
   process.on('message', (message) => {
     if (!closing) void handle(message).catch(() => close());
   });
-  if (producer.status().closed) {
-    await producer.close();
-    throw new Error('Ancestor pressure prevents startup');
-  }
   send({ event: 'ready' });
 }
+
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url)
   await main();

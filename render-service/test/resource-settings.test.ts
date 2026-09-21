@@ -1,7 +1,13 @@
 import { resolve } from 'node:path';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { lstatSync, readFileSync, realpathSync } from 'node:fs';
-import { readResourceSettings, assertCanonicalProjectRoot } from '../src/resource-settings.mjs';
+import {
+  readResourceSettings,
+  assertCanonicalProjectRoot,
+  assertRootOwnedDirectory,
+  assertRootOwnedWorkerTraversableDirectory,
+  assertRootOwnedExecutable,
+} from '../src/resource-settings.mjs';
 
 vi.mock('node:fs', () => ({
   lstatSync: vi.fn(),
@@ -74,4 +80,26 @@ it.each(['/opt/projects/', '/opt/other/../projects'])(
 it('rejects a regular file used as the project root', () => {
   stats.set('/opt/projects', { uid: 0, mode: 0o644, type: 'file' });
   expect(() => assertCanonicalProjectRoot('/opt/projects')).toThrow('directory');
+});
+it('requires a canonical root-owned non-writable state directory', () => {
+  stats.set('/run/openmaic-resource', { uid: 0, mode: 0o755, type: 'directory' });
+  expect(() => assertRootOwnedDirectory('/run/openmaic-resource')).not.toThrow();
+  stats.get('/run/openmaic-resource')!.mode = 0o775;
+  expect(() => assertRootOwnedDirectory('/run/openmaic-resource')).toThrow('root-owned');
+});
+it('requires execute-only traversal for the unprivileged task worker', () => {
+  stats.set('/run/openmaic-resource', { uid: 0, mode: 0o711, type: 'directory' });
+  expect(() =>
+    assertRootOwnedWorkerTraversableDirectory('/run/openmaic-resource'),
+  ).not.toThrow();
+  stats.get('/run/openmaic-resource')!.mode = 0o700;
+  expect(() => assertRootOwnedWorkerTraversableDirectory('/run/openmaic-resource')).toThrow(
+    'other-execute traversal',
+  );
+});
+it('requires fixed root-owned executable tool paths', () => {
+  stats.set('/usr/bin/ffmpeg', { uid: 0, mode: 0o755, type: 'file' });
+  expect(() => assertRootOwnedExecutable('/usr/bin/ffmpeg')).not.toThrow();
+  stats.get('/usr/bin/ffmpeg')!.mode = 0o644;
+  expect(() => assertRootOwnedExecutable('/usr/bin/ffmpeg')).toThrow('executable');
 });

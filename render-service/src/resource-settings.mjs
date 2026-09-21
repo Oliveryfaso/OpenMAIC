@@ -34,3 +34,27 @@ export function assertCanonicalProjectRoot(path) {
   if (!lstatSync(path).isDirectory())
     throw new Error('PRODUCER_TMP_PROJECT_DIR must be a directory');
 }
+
+export function assertRootOwnedDirectory(path, name = 'resource directory') {
+  if (!isAbsolute(path) || resolve(path) !== realpathSync(path))
+    throw new Error(`${name} must resolve to an absolute canonical path without symlinks`);
+  const stat = lstatSync(path);
+  if (!stat.isDirectory() || stat.uid !== 0 || (stat.mode & 0o022) !== 0)
+    throw new Error(`${name} must be a root-owned directory not writable by group or others`);
+}
+
+/** A task worker needs path traversal without directory listing or write access. */
+export function assertRootOwnedWorkerTraversableDirectory(path, name = 'resource directory') {
+  assertRootOwnedDirectory(path, name);
+  const stat = lstatSync(path);
+  if ((stat.mode & 0o001) === 0)
+    throw new Error(`${name} must grant other-execute traversal to the unprivileged task worker`);
+}
+
+export function assertRootOwnedExecutable(path, name = 'resource executable') {
+  if (!isAbsolute(path) || resolve(path) !== realpathSync(path))
+    throw new Error(`${name} must resolve to an absolute canonical path without symlinks`);
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.uid !== 0 || (stat.mode & 0o022) !== 0 || (stat.mode & 0o111) === 0)
+    throw new Error(`${name} must be a root-owned executable not writable by group or others`);
+}

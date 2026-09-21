@@ -222,27 +222,6 @@ jobs:
           cache: npm
           cache-dependency-path: render-service/package-lock.json
 
-      - name: Read fixed Producer source identity
-        id: producer-source
-        run: |
-          node --input-type=module - <<'JS'
-          import { readFileSync, appendFileSync } from 'node:fs';
-          const { revision } = JSON.parse(readFileSync('render-service/producer-patch/source.json', 'utf8'));
-          if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error('Invalid source revision');
-          appendFileSync(process.env.GITHUB_OUTPUT, `revision=${revision}\n`);
-          JS
-
-      - uses: actions/checkout@v5
-        with:
-          repository: heygen-com/hyperframes
-          ref: ${{ steps.producer-source.outputs.revision }}
-          path: .producer-source
-          persist-credentials: false
-          lfs: false
-
-      - name: Verify fixed Producer source patch (no install or native execution)
-        run: node render-service/scripts/build-resource-producer.mjs --check "$GITHUB_WORKSPACE/.producer-source"
-
       - name: Install
         working-directory: render-service
         run: npm ci
@@ -254,24 +233,6 @@ jobs:
       - name: Unit Tests
         working-directory: render-service
         run: npm test
-
-      - name: Patched Producer owner tests (no native execution)
-        run: |
-          git -C .producer-source apply "$GITHUB_WORKSPACE/render-service/producer-patch/producer.patch"
-          ln -s "$GITHUB_WORKSPACE/render-service/node_modules" .producer-source/node_modules
-          cd .producer-source
-          ../render-service/node_modules/.bin/vitest run --config ../render-service/producer-patch/vitest.config.mjs \
-            packages/engine/src/utils/temporaryCleanup.test.ts \
-            packages/producer/src/resources/admission.test.ts \
-            packages/producer/src/resources/linux.test.ts \
-            packages/producer/src/resources/supervisor.test.ts \
-            packages/producer/src/resources/installed-linux-evidence.test.ts \
-            packages/producer/src/services/render/artifactTransaction.test.ts \
-            packages/producer/src/services/render/renderExecutionContext.test.ts
-          ../render-service/node_modules/.bin/vitest run --config ../render-service/producer-patch/vitest.config.mjs \
-            packages/engine/src/services/browserManager.test.ts \
-            packages/engine/src/utils/urlDownloader.test.ts \
-            -t "keeps supervised profiles|keeps one visible inode"
 
       - name: Build container image
         run: docker build --tag openmaic-render-service:ci render-service
@@ -394,3 +355,58 @@ jobs:
           name: playwright-report
           path: playwright-report/
           retention-days: 7
+
+  docker-main-image:
+    name: Main image (deps + builder)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # The main Dockerfile was never built in CI, so an install step that no
+    # longer fits in a small Docker VM (#1526) or fails on the host's mounts
+    # (#1506) only surfaced on users' machines. Build the deps and builder
+    # stages whenever an input to them changes; the runner stage only copies
+    # their outputs.
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect main-image changes
+        id: changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then base="$PR_BASE"; else base="$PUSH_BEFORE"; fi
+          if [ -z "$base" ] || ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The builder stage copies the whole context (`COPY . .`), so almost any
+          # file is an image input. Skip only when every changed file is docs.
+          changed="$(git diff --name-only "$base" "$GITHUB_SHA")"
+          if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -qvE '(^docs/|\.md$)'; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Only documentation changed; skipping the image build."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Buildx
+        if: steps.changes.outputs.changed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      # target=builder builds deps as well (COPY --from=deps), which is where
+      # the install and the package builds run.
+      - name: Build deps + builder stages
+        if: steps.changes.outputs.changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          push: false
+          load: false
+          cache-from: type=gha,scope=openmaic-main-image
+          cache-to: type=gha,scope=openmaic-main-image,mode=max

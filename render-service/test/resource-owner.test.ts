@@ -1,38 +1,39 @@
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { createResourceHandler } from '../src/resource-owner.mjs';
 import { assertCanonicalProjectRoot } from '../src/resource-settings.mjs';
+
 const roots: string[] = [];
 beforeEach(() => vi.spyOn(console, 'error').mockImplementation(() => {}));
 afterEach(() => vi.restoreAllMocks());
 afterEach(() => roots.splice(0).forEach((path) => rmSync(path, { recursive: true, force: true })));
-class BudgetedRenderError extends Error {
-  constructor(readonly settlement: object) {
-    super('cancelled with cleanup');
-  }
-}
-function handler() {
+
+const succeeded = {
+  status: 'succeeded',
+  published: true,
+  cleanupVerified: true,
+  reservationReturned: true,
+  admissionClosed: false,
+  details: { cgroupRemoved: true },
+};
+
+function fixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'resource-owner-')));
   roots.push(root);
   const projectDir = join(root, 'render-1');
   mkdirSync(projectDir);
-  const render = vi.fn(async (_request, _budget, _run) => ({
-    reservationReturned: true,
-    residual: { cpuStat: 'usage_usec 1' },
-  }));
+  const taskRunner = vi.fn(async () => succeeded);
   const send = vi.fn();
   const close = vi.fn();
   const handle = createResourceHandler({
-    producer: { render, status: () => ({ closed: false }) },
+    taskRunner,
     settings: {
       projectRoot: root,
       owner: { workerUid: process.getuid?.() },
       task: { cpuMillis: 1000, memoryBytes: 805306368 },
     },
-    createRenderRequest: (value) => value,
-    BudgetedRenderError,
     send,
     close,
   });
@@ -41,24 +42,26 @@ function handler() {
     id: 'one',
     projectDir,
     outputPath: join(projectDir, 'output.mp4'),
-    options: { fps: 30, quality: 'standard' },
+    options: { fps: 30, quality: 'standard', format: 'mp4' },
     timeoutMs: 5000,
     deadlineNs: String(process.hrtime.bigint() + 5_000_000_000n),
   };
-  return { handle, render, send, close, request };
+  return { handle, taskRunner, send, close, request };
 }
-it('ignores cancellation arriving after the result and reuses the same owner', async () => {
-  const { handle, request, render, close } = handler();
+
+it('ignores cancellation arriving after settlement and reuses the same owner', async () => {
+  const { handle, request, taskRunner, close } = fixture();
   await handle(request);
   await handle({ event: 'cancel', id: request.id });
   await handle({ ...request, id: 'two' });
   expect(close).not.toHaveBeenCalled();
-  expect(render).toHaveBeenCalledTimes(2);
+  expect(taskRunner).toHaveBeenCalledTimes(2);
 });
+
 it('does not turn an expired IPC deadline into a new full task deadline', async () => {
-  const { handle, request, render, send } = handler();
+  const { handle, request, taskRunner, send } = fixture();
   await handle({ ...request, deadlineNs: '1' });
-  expect(render).not.toHaveBeenCalled();
+  expect(taskRunner).not.toHaveBeenCalled();
   expect(send).toHaveBeenCalledWith(
     expect.objectContaining({
       event: 'result',
@@ -66,71 +69,93 @@ it('does not turn an expired IPC deadline into a new full task deadline', async 
         status: 'failed',
         failure: expect.objectContaining({ code: 'deadline_exceeded' }),
         resources: expect.objectContaining({
+          cleanupVerified: true,
           reservationReturned: true,
-          details: {
-            published: false,
-            cleanupVerified: true,
-            reservationReturned: true,
-            notAdmitted: true,
-          },
+          details: { notAdmitted: true },
         }),
       }),
     }),
   );
 });
-it('subtracts transport time before invoking the original Producer API', async () => {
-  const { handle, request, render } = handler();
+
+it('subtracts transport time before invoking the outer task runner', async () => {
+  const { handle, request, taskRunner } = fixture();
   await handle({ ...request, deadlineNs: String(process.hrtime.bigint() + 1_000_000_000n) });
-  const run = render.mock.calls[0]?.[2];
-  expect(run.timeoutMs).toBeGreaterThan(0);
-  expect(run.timeoutMs).toBeLessThanOrEqual(1000);
+  const taskRequest = taskRunner.mock.calls[0]?.[1];
+  expect(taskRequest.timeoutMs).toBeGreaterThan(0);
+  expect(taskRequest.timeoutMs).toBeLessThanOrEqual(1000);
 });
-it('preserves deadline classification and settlement when the worker error contains only logs', async () => {
-  const { handle, request, render, send } = handler();
-  const details = {
+
+it('keeps publication and reservation settlement independent', async () => {
+  const { handle, request, taskRunner, send } = fixture();
+  const details = { publishFailure: 'rename failed after cleanup' };
+  taskRunner.mockResolvedValueOnce({
+    status: 'failed',
+    failureCode: 'execution_failed',
     published: false,
     cleanupVerified: true,
     reservationReturned: true,
-    residual: { memoryCurrent: '123' },
-  };
-  const clock = vi.spyOn(process.hrtime, 'bigint').mockReturnValue(1_000_000_000n);
-  try {
-    render.mockImplementationOnce(async () => {
-      clock.mockReturnValue(3_000_000_000n);
-      const error = new BudgetedRenderError(details);
-      error.message = '[INFO] encoding frames';
-      throw error;
-    });
-    await handle({ ...request, deadlineNs: '2000000000' });
-    expect(render).toHaveBeenCalledOnce();
-    expect(send).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: 'result',
-        result: expect.objectContaining({
-          status: 'failed',
-          failure: { code: 'deadline_exceeded', message: 'Render exceeded the deadline' },
-          resources: expect.objectContaining({ reservationReturned: true, details }),
-        }),
+    admissionClosed: false,
+    details,
+  });
+  await handle(request);
+  expect(send).toHaveBeenCalledWith(
+    expect.objectContaining({
+      result: expect.objectContaining({
+        status: 'failed',
+        resources: {
+          published: false,
+          cleanupVerified: true,
+          reservationReturned: true,
+          admissionClosed: false,
+          details,
+        },
       }),
-    );
-  } finally {
-    clock.mockRestore();
-  }
+    }),
+  );
 });
-it('forwards cancellation to the active original Producer and preserves failed settlement', async () => {
-  const { handle, request, render, send } = handler();
-  const details = {
+
+it('forwards only the bounded startup diagnostic code alongside private details', async () => {
+  const { handle, request, taskRunner, send } = fixture();
+  taskRunner.mockResolvedValueOnce({
+    status: 'failed',
+    failureCode: 'execution_failed',
     published: false,
-    cleanupVerified: true,
-    reservationReturned: true,
-    residual: { cpuStat: 'usage_usec 44', memoryCurrent: '123' },
-  };
-  render.mockImplementationOnce(
-    async (_request, _budget, run) =>
-      new Promise((_resolve, reject) => {
-        run.signal.addEventListener('abort', () => reject(new BudgetedRenderError(details)), {
-          once: true,
-        });
+    cleanupVerified: false,
+    reservationReturned: false,
+    admissionClosed: true,
+    diagnosticCode: 'main_pid_read_error',
+    details: { diagnostic: { error: '/proc/42/cgroup: permission denied' } },
+  });
+  await handle(request);
+  expect(send).toHaveBeenCalledWith(
+    expect.objectContaining({
+      result: expect.objectContaining({
+        resources: expect.objectContaining({ diagnosticCode: 'main_pid_read_error' }),
+      }),
+    }),
+  );
+});
+
+it('forwards cancellation to the active outer task and preserves confirmed cleanup', async () => {
+  const { handle, request, taskRunner, send } = fixture();
+  taskRunner.mockImplementationOnce(
+    async (_settings, _taskRequest, signal) =>
+      new Promise((resolve) => {
+        signal.addEventListener(
+          'abort',
+          () =>
+            resolve({
+              status: 'cancelled',
+              failureCode: 'cancelled',
+              published: false,
+              cleanupVerified: true,
+              reservationReturned: true,
+              admissionClosed: false,
+              details: { platformCleanup: true },
+            }),
+          { once: true },
+        );
       }),
   );
   const pending = handle(request);
@@ -138,31 +163,97 @@ it('forwards cancellation to the active original Producer and preserves failed s
   await pending;
   expect(send).toHaveBeenCalledWith(
     expect.objectContaining({
-      event: 'result',
       result: expect.objectContaining({
         status: 'cancelled',
-        resources: expect.objectContaining({ reservationReturned: true, details }),
+        resources: expect.objectContaining({ reservationReturned: true }),
       }),
     }),
   );
 });
 
-it('fails closed for an invoked Producer error without inventing settlement evidence', async () => {
-  const { handle, request, render, send } = handler();
-  render.mockRejectedValueOnce(new TypeError('unexpected producer error'));
+it('fails closed for an invoked owner error without inventing cleanup evidence', async () => {
+  const { handle, request, taskRunner, send } = fixture();
+  taskRunner.mockRejectedValueOnce(new TypeError('unexpected owner error'));
   await handle(request);
-  expect(send).not.toHaveBeenCalledWith({ event: 'closed' });
-  expect(send).toHaveBeenCalledTimes(1);
+  expect(handle.accepting()).toBe(false);
   expect(send).toHaveBeenCalledWith(
     expect.objectContaining({
-      event: 'result',
       result: expect.objectContaining({
         status: 'failed',
         resources: expect.objectContaining({
           cleanupVerified: false,
           reservationReturned: false,
           admissionClosed: true,
-          details: { unexpectedFailure: true },
+          details: { unexpectedOwnerFailure: true },
+        }),
+      }),
+    }),
+  );
+});
+
+it('rejects a pressure-raced request without invoking the task or inventing cleanup work', async () => {
+  const { request, taskRunner, send, close } = fixture();
+  const root = dirname(request.projectDir);
+  const handle = createResourceHandler({
+    taskRunner,
+    settings: {
+      projectRoot: root,
+      owner: { workerUid: process.getuid?.() },
+      task: { cpuMillis: 1000, memoryBytes: 805306368 },
+    },
+    send,
+    close,
+    admissionGuard: () => false,
+  });
+  await handle(request);
+  expect(taskRunner).not.toHaveBeenCalled();
+  expect(close).not.toHaveBeenCalled();
+  expect(handle.accepting()).toBe(false);
+  expect(send).toHaveBeenCalledWith({ event: 'closed' });
+  expect(send).toHaveBeenCalledWith(
+    expect.objectContaining({
+      event: 'result',
+      result: expect.objectContaining({
+        status: 'failed',
+        resources: expect.objectContaining({
+          cleanupVerified: true,
+          reservationReturned: true,
+          admissionClosed: true,
+          details: { notAdmitted: true },
+        }),
+      }),
+    }),
+  );
+});
+
+it('closes admission after an active task settles without changing its cleanup result', async () => {
+  const { handle: unused, request, taskRunner, send, close } = fixture();
+  void unused;
+  const root = dirname(request.projectDir);
+  const admissionGuard = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(false);
+  const handle = createResourceHandler({
+    taskRunner,
+    settings: {
+      projectRoot: root,
+      owner: { workerUid: process.getuid?.() },
+      task: { cpuMillis: 1000, memoryBytes: 805306368 },
+    },
+    send,
+    close,
+    admissionGuard,
+  });
+  await handle(request);
+  expect(handle.accepting()).toBe(false);
+  expect(send).toHaveBeenCalledWith({ event: 'closed' });
+  expect(send).toHaveBeenCalledWith(
+    expect.objectContaining({
+      event: 'result',
+      result: expect.objectContaining({
+        status: 'succeeded',
+        resources: expect.objectContaining({
+          cleanupVerified: true,
+          reservationReturned: true,
+          admissionClosed: true,
         }),
       }),
     }),
@@ -178,27 +269,16 @@ it('rejects an actual symlinked ancestor before accepting the configured project
   expect(() => assertCanonicalProjectRoot(join(root, 'real/projects'))).not.toThrow();
 });
 
-it.each(['settled', 'unexpected'])(
-  'keeps %s internal errors out of normal IPC failure messages',
-  async (kind) => {
-    const { handle, request, render, send } = handler();
-    const error =
-      kind === 'settled'
-        ? new BudgetedRenderError({
-            published: false,
-            cleanupVerified: true,
-            reservationReturned: true,
-          })
-        : new Error();
-    error.message = 'guardian /sys/fs/cgroup/private-session diagnostics';
-    render.mockRejectedValueOnce(error);
-    await handle(request);
-    const result = send.mock.calls.find(([message]) => message.event === 'result')![0].result;
-    expect(result.failure).toEqual({
-      code: 'execution_failed',
-      message: 'Resource render failed; see service logs',
-    });
-    expect(result.failure.message).not.toContain('private-session');
-    expect(console.error).toHaveBeenCalledWith('Resource render failed:', error);
-  },
-);
+it('keeps internal owner errors out of normal IPC failure messages', async () => {
+  const { handle, request, taskRunner, send } = fixture();
+  const error = new Error('system.slice/private-session diagnostics');
+  taskRunner.mockRejectedValueOnce(error);
+  await handle(request);
+  const result = send.mock.calls.find(([message]) => message.event === 'result')![0].result;
+  expect(result.failure).toEqual({
+    code: 'execution_failed',
+    message: 'Resource render failed; see service logs',
+  });
+  expect(result.failure.message).not.toContain('private-session');
+  expect(console.error).toHaveBeenCalledWith('Resource render failed:', error);
+});
