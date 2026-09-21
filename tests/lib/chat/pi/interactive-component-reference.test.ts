@@ -149,6 +149,16 @@ describe('Interactive static component reference', () => {
     expect(linkedomCapture.inputs.at(-1)).not.toContain('BODY_DIRECT_SECRET');
   });
 
+  it('keeps component text normalization unchanged for adjacent independent items', () => {
+    const result = resolve(
+      '<section id="density-slider"><button>Pause</button><button>Refresh</button>' +
+        '<select><option>600</option><option>1400</option></select>' +
+        '<table><tr><th>Score</th><td>10</td></tr></table></section>',
+    );
+
+    expect(result.evidence.component.sourceText).toBe('PauseRefresh6001400 Score10');
+  });
+
   it('supports SVG roots as source markup without claiming rendered pixels', () => {
     const result = resolve(
       '<svg viewBox="0 0 20 20"><g id="vector"><path d="M0 0 L20 20"/></g></svg>',

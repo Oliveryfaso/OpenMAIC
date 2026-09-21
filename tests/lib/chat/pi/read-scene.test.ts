@@ -274,7 +274,25 @@ describe('Pi Director read_scene', () => {
     expect(text).not.toContain('DIRECT_SCRIPT_SECRET');
   });
 
-  it('keeps the existing fail-without-truncation scene evidence budget', async () => {
+  it('separates independent static items without splitting inline words and units', async () => {
+    const body = makeInteractiveBody(
+      '<table><tr><th>Wrong box</th><td>−5 points</td><td>word returns</td></tr></table>' +
+        '<select><option>600</option><option>1000</option><option>1400</option></select>' +
+        '<button>Pause</button><button>Refresh</button><button>Reset</button>' +
+        '<p><span>inter</span><span>active</span> <span>kg</span>/<span>m</span><sup>3</sup></p>',
+    );
+    const result = await buildReadSceneTool({ body }).execute('read-items', {
+      sceneId: 'scene-game',
+    });
+    const text = result.content[0]?.type === 'text' ? result.content[0].text : '';
+
+    expect(text).toContain('Wrong box −5 points word returns');
+    expect(text).toContain('600 1000 1400');
+    expect(text).toContain('Pause Refresh Reset');
+    expect(text).toContain('interactive kg/m3');
+  });
+
+  it('retains outline evidence and explicitly omits oversized static text without truncation', async () => {
     const onEvidence = vi.fn();
     const body = makeInteractiveBody(
       `<!doctype html><html><body><main>${'A'.repeat(25_000)}</main></body></html>`,
@@ -284,11 +302,44 @@ describe('Pi Director read_scene', () => {
     const result = await tool.execute('read-large-game', { sceneId: 'scene-game' });
     const text = result.content[0]?.type === 'text' ? result.content[0].text : '';
 
+    expect((result as { isError?: boolean }).isError).not.toBe(true);
+    expect(result.details).toMatchObject({ status: 'ok', truncated: false });
+    expect(text).toContain('Sort each word into the correct category.');
+    expect(text).toContain('A new word appears every 3 seconds');
+    expect(text).toContain('unavailable because the static text exceeds the scene evidence budget');
+    expect(text).not.toContain('AAAA');
+    expect(onEvidence).toHaveBeenCalledWith(expect.objectContaining({ content: text }));
+  });
+
+  it('still rejects oversized base evidence without installing a partial packet', async () => {
+    const onEvidence = vi.fn();
+    const body = makeInteractiveBody('<p>Short rule.</p>');
+    body.storeState.outlines![0].description = 'B'.repeat(25_000);
+    const result = await buildReadSceneTool({ body, onEvidence }).execute('read-large-outline', {
+      sceneId: 'scene-game',
+    });
+
     expect((result as { isError?: boolean }).isError).toBe(true);
     expect(result.details).toMatchObject({ status: 'too_large', truncated: false });
-    expect(text).toContain('too large for read_scene v1');
-    expect(text).toContain('not silently truncated');
-    expect(text).not.toContain('AAAA');
+    expect(onEvidence).not.toHaveBeenCalled();
+  });
+
+  it('counts the static-unavailable note in the fallback evidence budget', async () => {
+    const body = makeInteractiveBody(`<p>${'A'.repeat(25_000)}</p>`);
+    const onEvidence = vi.fn();
+    const tool = buildReadSceneTool({ body, onEvidence });
+    const first = await tool.execute('measure-fallback', { sceneId: 'scene-game' });
+    const text = first.content[0]?.type === 'text' ? first.content[0].text : '';
+    // The existing budget covers the evidence body, before the provenance header.
+    const evidenceLength = text.slice(text.indexOf('\n') + 1).length;
+    body.storeState.outlines![0].description += 'B'.repeat(24_000 - evidenceLength);
+
+    const atLimit = await tool.execute('read-at-limit', { sceneId: 'scene-game' });
+    expect(atLimit.details.status).toBe('ok');
+    onEvidence.mockClear();
+    body.storeState.outlines![0].description += 'B';
+    const overLimit = await tool.execute('read-over-limit', { sceneId: 'scene-game' });
+    expect(overLimit.details).toMatchObject({ status: 'too_large', truncated: false });
     expect(onEvidence).not.toHaveBeenCalled();
   });
 });

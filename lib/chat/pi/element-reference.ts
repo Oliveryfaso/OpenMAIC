@@ -107,6 +107,9 @@ const TEXT_SEPARATOR_TAGS = new Set([
   'tr',
   'ul',
 ]);
+// Whole-page evidence needs boundaries between independently labeled items.
+// Keep ordinary inline text (including spans within words/units) continuous.
+const STATIC_SOURCE_ITEM_SEPARATOR_TAGS = new Set(['td', 'th', 'option', 'button']);
 
 export const ELEMENT_REFERENCE_ACCEPTED_HEADER = 'X-OpenMAIC-Element-Reference-Accepted';
 
@@ -1014,7 +1017,7 @@ function markTruncated(truncatedFields: string[], path: string): void {
   if (!truncatedFields.includes(path)) truncatedFields.push(path);
 }
 
-function normalizeStaticText(root: Node): string {
+function normalizeStaticText(root: Node, additionalSeparatorTags?: ReadonlySet<string>): string {
   const parts: string[] = [];
   const visit = (node: Node): void => {
     if (node.nodeType === 3) {
@@ -1028,7 +1031,7 @@ function normalizeStaticText(root: Node): string {
       parts.push(' ');
       return;
     }
-    const separated = TEXT_SEPARATOR_TAGS.has(tagName);
+    const separated = TEXT_SEPARATOR_TAGS.has(tagName) || additionalSeparatorTags?.has(tagName);
     if (separated) parts.push(' ');
     Array.from(element.childNodes).forEach(visit);
     if (separated) parts.push(' ');
@@ -1076,7 +1079,9 @@ export function extractInteractiveStaticSourceText(sourceHtml: string): string {
   const { document: parsedDocument } = parseHTML(compactSourceHtml);
   const document = parsedDocument as unknown as Document;
   const sourceRoot = document.body ?? document.documentElement;
-  return sourceRoot ? normalizeStaticText(sanitizeInteractiveSubtree(sourceRoot)) : '';
+  return sourceRoot
+    ? normalizeStaticText(sanitizeInteractiveSubtree(sourceRoot), STATIC_SOURCE_ITEM_SEPARATOR_TAGS)
+    : '';
 }
 
 function findSourceLabel(document: Document, element: Element): string | undefined {

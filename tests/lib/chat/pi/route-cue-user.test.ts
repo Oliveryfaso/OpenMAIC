@@ -633,6 +633,39 @@ describe('POST /api/chat/pi cue_user', () => {
     expect(captured.childPrompts[1]).not.toContain('课件源码中的静态说明');
   });
 
+  it.each([false, true])(
+    'delegates oversized-static fallback only when the base evidence fits (oversized base: %s)',
+    async (oversizedBase) => {
+      const captured = {
+        childPrompts: [] as string[],
+        callAgentResults: [] as Array<Record<string, unknown>>,
+      };
+      mockDirectorReadSceneDelegation(captured);
+      const body = makeInteractiveWordGameBody();
+      body.storeState.scenes[0].content.html = `<p>${'STATIC_SENTINEL '.repeat(2_000)}</p>`;
+      if (oversizedBase) body.storeState.outlines[0].description = 'B'.repeat(25_000);
+
+      const { POST } = await import('@/app/api/chat/pi/route');
+      const response = await POST(makeRequest(body));
+      await readSseEvents(response);
+
+      expect(response.status).toBe(200);
+      expect(captured.childPrompts[0]).not.toContain('STATIC_SENTINEL');
+      if (oversizedBase) {
+        expect(captured.callAgentResults[0]?.details).not.toHaveProperty('sceneEvidence');
+        expect(captured.childPrompts[0]).not.toContain('课件源码中的静态说明');
+      } else {
+        expect(captured.childPrompts[0]).toContain('Sort each word into the correct category.');
+        expect(captured.childPrompts[0]).toContain('A new word appears every 3 seconds');
+        expect(captured.childPrompts[0]).toContain(
+          'unavailable because the static text exceeds the scene evidence budget',
+        );
+        expect(captured.callAgentResults[0]?.details).toHaveProperty('sceneEvidence');
+      }
+      expect(captured.callAgentResults[1]?.details).not.toHaveProperty('sceneEvidence');
+    },
+  );
+
   it('keeps static rules separate from unavailable current state in Teacher evidence', async () => {
     process.env[COURSEWARE_REFERENCE_FLAG] = 'true';
     vi.resetModules();
