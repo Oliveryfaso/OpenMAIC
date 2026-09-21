@@ -2,8 +2,6 @@ import { execFileSync, spawn } from 'node:child_process';
 import {
   closeSync,
   constants,
-  copyFileSync,
-  existsSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -13,7 +11,6 @@ import {
   realpathSync,
   renameSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -21,6 +18,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { scanExternalReferences } from './resource-reference-scan.mjs';
 
 const WORKER = fileURLToPath(new URL('./resource-task-worker.mjs', import.meta.url));
+const STAGE_COPY = fileURLToPath(new URL('./resource-stage-copy.mjs', import.meta.url));
+const MAX_TRANSFER_OUTPUT = 64 * 1024;
 const MAX_ACCOUNTING_BYTES = 64 * 1024;
 const ACCOUNTING_FILES = Object.freeze({
   memoryCurrent: 'memory.current',
@@ -37,6 +36,80 @@ function bounded(value) {
 
 function command(file, args) {
   execFileSync(file, args, { stdio: ['ignore', 'inherit', 'inherit'], timeout: 20_000 });
+}
+
+export function buildStageCopyArguments(config, candidate, stagePath) {
+  return [
+    `--reuid=${config.workerUid}`,
+    `--regid=${config.workerGid}`,
+    '--clear-groups',
+    '--bounding-set=-all',
+    '--inh-caps=-all',
+    '--ambient-caps=-all',
+    '--no-new-privs',
+    process.execPath,
+    STAGE_COPY,
+    candidate,
+    stagePath,
+    String(config.workerUid),
+    String(config.workerGid),
+  ];
+}
+
+/** Run the trusted byte copier only after setpriv has dropped all root authority. */
+export async function transferCandidate(config, candidate, stagePath, dependencies = {}) {
+  const launch = dependencies.spawn ?? spawn;
+  const onChild = dependencies.onChild ?? (() => {});
+  const child = launch('/usr/bin/setpriv', buildStageCopyArguments(config, candidate, stagePath), {
+    // Keep pre-setpriv process setup on a trusted directory. The helper uses
+    // absolute paths and resolves both worker-controlled paths only after uid
+    // and capabilities have been dropped.
+    cwd: '/',
+    env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, LANG: 'C.UTF-8' },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  onChild(child);
+  let stdout = '';
+  child.stdout?.on('data', (chunk) => {
+    if (Buffer.byteLength(stdout) <= MAX_TRANSFER_OUTPUT) stdout += String(chunk);
+  });
+  const completion = await new Promise((resolveClose) => {
+    let launchError;
+    child.once('error', (error) => {
+      launchError = bounded(error.message);
+    });
+    child.once('close', (code, signal) => resolveClose({ code, signal, error: launchError }));
+  });
+  onChild(undefined);
+  if (Buffer.byteLength(stdout) > MAX_TRANSFER_OUTPUT)
+    throw new Error('Stage copy returned oversized evidence');
+  if (completion.error || completion.code !== 0)
+    throw new Error(
+      completion.error
+        ? `Unprivileged stage copy failed: ${completion.error}`
+        : `Unprivileged stage copy exited with ${completion.code ?? completion.signal ?? 'unknown status'}`,
+    );
+  let result;
+  try {
+    result = JSON.parse(stdout);
+  } catch {
+    throw new Error('Stage copy returned invalid evidence');
+  }
+  if (
+    !result ||
+    typeof result !== 'object' ||
+    !Number.isSafeInteger(result.bytes) ||
+    result.bytes <= 0 ||
+    result.uid !== config.workerUid ||
+    result.gid !== config.workerGid ||
+    result.mode !== 0o600 ||
+    !Number.isSafeInteger(result.sourceDevice) ||
+    !Number.isSafeInteger(result.destinationDevice)
+  )
+    throw new Error('Stage copy evidence did not match the configured identity');
+  if (result.sourceDevice === result.destinationDevice)
+    throw new Error('Candidate and staging file are not on independent filesystems');
+  return result;
 }
 
 function writeResult(path, value) {
@@ -192,6 +265,107 @@ function validateConfig(config) {
     throw new Error('Invalid Producer environment');
 }
 
+/**
+ * Execute the production closeout gates after the Producer worker exits.
+ * Tests call this same function so deleting a drain, reference, transfer, or
+ * unmount gate from the real task path is observable in-repository.
+ */
+export async function closeoutTask(
+  {
+    config,
+    group,
+    privateRoot,
+    privateProject,
+    candidate,
+    workerExit,
+    isStopping,
+    projectMounted: initialProjectMounted,
+    privateMounted: initialPrivateMounted,
+  },
+  dependencies = {},
+) {
+  const drainTask = dependencies.drain ?? drain;
+  const scanReferences = dependencies.scanReferences ?? scanExternalReferences;
+  const transfer = dependencies.transfer ?? transferCandidate;
+  const runCommand = dependencies.command ?? command;
+  const remove = dependencies.remove ?? rmSync;
+  let projectMounted = initialProjectMounted;
+  let privateMounted = initialPrivateMounted;
+  let status = 'failed';
+  let failureCode = 'execution_failed';
+  let cleanupVerified = false;
+  let referencesClear = false;
+  const details = {};
+  try {
+    const drained = await drainTask(group, config.cleanupTimeoutMs);
+    details.descendantDrain = drained;
+    if (!drained.drained) throw new Error('Task descendants did not drain');
+
+    const taskCgroup = group.slice('/sys/fs/cgroup'.length);
+    const referenceScan = scanReferences(privateRoot, taskCgroup);
+    details.referenceScan = referenceScan;
+    if (referenceScan.status !== 'CLEAR')
+      throw new Error(
+        referenceScan.status === 'REFERENCED'
+          ? 'Task-private filesystem still has external references'
+          : 'Task-private reference scan could not be completed',
+      );
+    referencesClear = true;
+
+    if (isStopping()) failureCode = 'cancelled';
+    if (!isStopping() && workerExit.code === 0) {
+      details.transfer = await transfer(config, candidate, config.stagePath);
+      if (isStopping()) {
+        failureCode = 'cancelled';
+        throw new Error('Task cancelled during stage transfer');
+      }
+      status = 'succeeded';
+    }
+
+    runCommand('/usr/bin/umount', [privateProject]);
+    projectMounted = false;
+    runCommand('/usr/bin/umount', [privateRoot]);
+    privateMounted = false;
+    remove(privateRoot, { recursive: true, force: true });
+    cleanupVerified = true;
+  } catch (error) {
+    details.failure = bounded(error instanceof Error ? error.message : error);
+    const drained = await drainTask(group, config.cleanupTimeoutMs);
+    details.failureDrain = drained;
+    if (projectMounted) {
+      try {
+        runCommand('/usr/bin/umount', [privateProject]);
+        projectMounted = false;
+      } catch (unmountError) {
+        details.projectUnmountFailure = bounded(
+          unmountError instanceof Error ? unmountError.message : unmountError,
+        );
+      }
+    }
+    if (privateMounted) {
+      try {
+        runCommand('/usr/bin/umount', [privateRoot]);
+        privateMounted = false;
+      } catch (unmountError) {
+        details.privateUnmountFailure = bounded(
+          unmountError instanceof Error ? unmountError.message : unmountError,
+        );
+      }
+    }
+    cleanupVerified = referencesClear && drained.drained && !projectMounted && !privateMounted;
+    status = 'failed';
+    if (isStopping()) failureCode = 'cancelled';
+  }
+  return {
+    status,
+    failureCode,
+    cleanupVerified,
+    projectMounted,
+    privateMounted,
+    details,
+  };
+}
+
 async function main() {
   if (process.platform !== 'linux' || process.getuid() !== 0)
     throw new Error('Resource task runner requires Linux root');
@@ -204,13 +378,13 @@ async function main() {
   const group = cgroupPath();
   let privateMounted = false;
   let projectMounted = false;
-  let worker;
+  let activeChild;
   let stopping = false;
   const stop = () => {
     stopping = true;
-    if (worker?.pid) {
+    if (activeChild?.pid) {
       try {
-        process.kill(worker.pid, 'SIGTERM');
+        process.kill(activeChild.pid, 'SIGTERM');
       } catch {}
     }
   };
@@ -219,7 +393,6 @@ async function main() {
   let status = 'failed';
   let failureCode = 'execution_failed';
   let cleanupVerified = false;
-  let referencesClear = false;
   const details = {
     cgroup: group,
     mountNamespace: readlinkSync('/proc/self/ns/mnt'),
@@ -261,7 +434,7 @@ async function main() {
       PRODUCER_ENABLE_BROWSER_POOL: 'false',
       ...config.producerEnvironment,
     };
-    worker = spawn(
+    activeChild = spawn(
       '/usr/bin/setpriv',
       [
         `--reuid=${config.workerUid}`,
@@ -284,53 +457,40 @@ async function main() {
       },
     );
     const workerExit = await new Promise((resolveExit) => {
-      worker.once('error', (error) => resolveExit({ code: null, error: bounded(error.message) }));
-      worker.once('exit', (code, signal) => resolveExit({ code, signal }));
-    });
-    details.workerExit = workerExit;
-    const drained = await drain(group, config.cleanupTimeoutMs);
-    details.descendantDrain = drained;
-    if (!drained.drained) throw new Error('Task descendants did not drain');
-    const taskCgroup = group.slice('/sys/fs/cgroup'.length);
-    const referenceScan = scanExternalReferences(privateRoot, taskCgroup);
-    details.referenceScan = referenceScan;
-    if (referenceScan.status !== 'CLEAR')
-      throw new Error(
-        referenceScan.status === 'REFERENCED'
-          ? 'Task-private filesystem still has external references'
-          : 'Task-private reference scan could not be completed',
+      activeChild.once('error', (error) =>
+        resolveExit({ code: null, error: bounded(error.message) }),
       );
-    referencesClear = true;
-    if (stopping) failureCode = 'cancelled';
-    if (!stopping && workerExit.code === 0) {
-      if (!existsSync(candidate) || statSync(candidate).size === 0)
-        throw new Error('Missing render candidate');
-      copyFileSync(candidate, config.stagePath, constants.COPYFILE_EXCL);
-      const stageFd = openSync(config.stagePath, constants.O_RDONLY);
-      try {
-        fsyncSync(stageFd);
-      } finally {
-        closeSync(stageFd);
-      }
-      const stageDirectoryFd = openSync(dirname(config.stagePath), constants.O_RDONLY);
-      try {
-        fsyncSync(stageDirectoryFd);
-      } finally {
-        closeSync(stageDirectoryFd);
-      }
-      const candidateDevice = statSync(candidate).dev;
-      const stageDevice = statSync(config.stagePath).dev;
-      details.transfer = { candidateDevice, stageDevice, bytes: statSync(config.stagePath).size };
-      if (candidateDevice === stageDevice)
-        throw new Error('Candidate and staging file are not on independent filesystems');
-      status = 'succeeded';
-    }
-    command('/usr/bin/umount', [privateProject]);
-    projectMounted = false;
-    command('/usr/bin/umount', [privateRoot]);
-    privateMounted = false;
-    rmSync(privateRoot, { recursive: true, force: true });
-    cleanupVerified = true;
+      activeChild.once('exit', (code, signal) => resolveExit({ code, signal }));
+    });
+    activeChild = undefined;
+    details.workerExit = workerExit;
+    const closeout = await closeoutTask(
+      {
+        config,
+        group,
+        privateRoot,
+        privateProject,
+        candidate,
+        workerExit,
+        isStopping: () => stopping,
+        projectMounted,
+        privateMounted,
+      },
+      {
+        transfer: (taskConfig, source, destination) =>
+          transferCandidate(taskConfig, source, destination, {
+            onChild: (child) => {
+              activeChild = child;
+            },
+          }),
+      },
+    );
+    status = closeout.status;
+    failureCode = closeout.failureCode;
+    cleanupVerified = closeout.cleanupVerified;
+    projectMounted = closeout.projectMounted;
+    privateMounted = closeout.privateMounted;
+    Object.assign(details, closeout.details);
   } catch (error) {
     details.failure = bounded(error instanceof Error ? error.message : error);
     const drained = await drain(group, config.cleanupTimeoutMs);
@@ -355,7 +515,7 @@ async function main() {
         );
       }
     }
-    cleanupVerified = referencesClear && drained.drained && !projectMounted && !privateMounted;
+    cleanupVerified = false;
     status = 'failed';
     if (stopping) failureCode = 'cancelled';
   }

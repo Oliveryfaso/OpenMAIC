@@ -421,6 +421,26 @@ export class RenderCoordinator {
       // true, and the catch below would drop the artifact this event describes.
       this.finishEvent(id, 'succeeded');
     } catch (error) {
+      const publicationCommitted = resources?.published === true;
+      if (publicationCommitted) {
+        // The root owner already crossed the atomic publication point. Store
+        // bookkeeping may fail, but it must not revoke the artifact record,
+        // delete the committed output, or let a late cancel relabel it. A
+        // confirmed-cleanup job remains eligible for ordinary TTL expiry.
+        const failure: RenderFailedFailure = {
+          code: 'execution_failed',
+          message: error instanceof Error ? error.message : String(error),
+        };
+        this.finishEvent(id, 'failed', failure.code);
+        await this.jobs.update(id, {
+          status: 'failed',
+          currentStage: 'failed',
+          failure,
+          error: failure.message,
+          resources,
+        });
+        return;
+      }
       await this.artifacts.remove(id).catch(() => {});
       if (abort.signal.aborted) {
         await this.finishNonSuccess(id, projectDir, {

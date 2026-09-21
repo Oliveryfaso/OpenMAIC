@@ -9,9 +9,11 @@ import {
   inspectMainPid,
   MAIN_PID_DIAGNOSTIC_CODES,
   publishStagedArtifact,
+  runResourceTask,
   TASK_DIRECTORY_MODE,
   taskSettlementDetails,
   waitForStarted,
+  waitForStopped,
 } from '../src/resource-systemd-runner.mjs';
 import { processIdentity } from '../src/resource-reference-scan.mjs';
 
@@ -261,6 +263,71 @@ it.each([
   expect(JSON.stringify(logs)).toContain('raw cgroup read failure');
 });
 
+it('does not report cleanup while a stopped unit cgroup still exists', async () => {
+  let clock = 0;
+  const exists = vi.fn(() => true);
+  const showUnit = vi.fn(async () => ({ found: true, ActiveState: 'inactive' }));
+
+  await expect(
+    waitForStopped('task.service', '/system.slice/task.service', 100, {
+      showUnit,
+      exists,
+      now: () => clock,
+      sleep: async (ms: number) => {
+        clock += ms;
+      },
+    }),
+  ).resolves.toEqual({
+    unit: { found: true, ActiveState: 'inactive' },
+    cgroupRemoved: false,
+  });
+  expect(showUnit).toHaveBeenCalledTimes(2);
+  expect(exists).toHaveBeenCalledWith('/sys/fs/cgroup/system.slice/task.service');
+});
+
+it('requires both a stopped unit and an absent cgroup before confirming cleanup', async () => {
+  let clock = 0;
+  const showUnit = vi
+    .fn()
+    .mockResolvedValueOnce({ found: true, ActiveState: 'active' })
+    .mockResolvedValueOnce({ found: true, ActiveState: 'inactive' });
+  const exists = vi.fn(() => false);
+
+  await expect(
+    waitForStopped('task.service', '/system.slice/task.service', 100, {
+      showUnit,
+      exists,
+      now: () => clock,
+      sleep: async (ms: number) => {
+        clock += ms;
+      },
+    }),
+  ).resolves.toEqual({
+    unit: { found: true, ActiveState: 'inactive' },
+    cgroupRemoved: true,
+  });
+  expect(showUnit).toHaveBeenCalledTimes(2);
+  expect(clock).toBe(50);
+});
+
+it('does not confirm cleanup at timeout when the unit remains active', async () => {
+  let clock = 0;
+
+  await expect(
+    waitForStopped('task.service', '/system.slice/task.service', 100, {
+      showUnit: async () => ({ found: true, ActiveState: 'active' }),
+      exists: () => false,
+      now: () => clock,
+      sleep: async (ms: number) => {
+        clock += ms;
+      },
+    }),
+  ).resolves.toEqual({
+    unit: { found: true, ActiveState: 'active' },
+    cgroupRemoved: false,
+  });
+});
+
 it('builds the bounded task unit before any Producer import', () => {
   const args = buildSystemdRunArguments(
     {
@@ -282,6 +349,183 @@ it('builds the bounded task unit before any Producer import', () => {
   expect(args).toContain('KillMode=control-group');
   expect(args).toContain('PrivateMounts=yes');
   expect(args.at(-1)).toBe('/run/openmaic-resource/task-abc/request.json');
+});
+
+function resourceTaskHarness(overrides: Record<string, unknown> = {}) {
+  const settleUnpublished = vi.fn(() => ({
+    status: 'failed',
+    failureCode: 'execution_failed',
+    published: false,
+    cleanupVerified: true,
+    reservationReturned: true,
+    admissionClosed: false,
+  }));
+  const finalizePublication = vi.fn(() => ({
+    status: 'succeeded',
+    published: true,
+    cleanupVerified: true,
+    reservationReturned: true,
+    admissionClosed: false,
+  }));
+  return {
+    settleUnpublished,
+    finalizePublication,
+    dependencies: {
+      randomUUID: () => '00000000-0000-0000-0000-000000000001',
+      createTaskDirectory: vi.fn(),
+      writeExclusiveJson: vi.fn(),
+      exec: vi.fn(async () => ({ stdout: '', stderr: '' })),
+      waitForStarted: vi.fn(async () => ({ controlGroup: '/tasks/task.service' })),
+      showUnit: vi.fn(async () => ({ found: true, ActiveState: 'inactive' })),
+      waitForStopped: vi.fn(async () => ({ cgroupRemoved: true })),
+      stopUnit: vi.fn(async () => {}),
+      exists: vi.fn(() => true),
+      readTaskResult: vi.fn(() => ({ status: 'succeeded', cleanupVerified: true, details: {} })),
+      settleUnpublished,
+      finalizePublication,
+      nowNs: vi.fn(() => 0n),
+      nowMs: vi.fn(() => 0),
+      sleep: vi.fn(async () => {}),
+      ...overrides,
+    },
+  };
+}
+
+const resourceTaskSettings = {
+  stateRoot: '/run/openmaic-resource',
+  owner: {
+    workerUid: 1001,
+    workerGid: 1001,
+    cleanupTimeoutMs: 100,
+    taskPidsMax: 256,
+    taskSlice: 'system.slice',
+    browserPath: '/opt/chrome',
+    ffmpegPath: '/usr/bin/ffmpeg',
+  },
+  task: { cpuMillis: 1000, memoryBytes: 805_306_368 },
+};
+
+const resourceTaskRequest = {
+  id: 'job-1',
+  projectDir: '/projects/job-1',
+  outputPath: '/projects/job-1/output.mp4',
+  options: { fps: 30, quality: 'standard', format: 'mp4' },
+  timeoutMs: 1000,
+  deadlineNs: '1000000000',
+};
+
+it('publishes only after the production owner observes cgroup removal and task cleanup', async () => {
+  const harness = resourceTaskHarness();
+  const result = await runResourceTask(
+    resourceTaskSettings,
+    resourceTaskRequest,
+    new AbortController().signal,
+    harness.dependencies,
+  );
+  expect(result).toMatchObject({ status: 'succeeded', published: true });
+  expect(harness.finalizePublication).toHaveBeenCalledOnce();
+  expect(harness.settleUnpublished).not.toHaveBeenCalled();
+});
+
+it('does not publish without cgroup-removal or task-cleanup readback', async () => {
+  const missingCgroup = resourceTaskHarness({
+    waitForStopped: vi.fn(async () => ({ cgroupRemoved: false })),
+  });
+  const cgroupResult = await runResourceTask(
+    resourceTaskSettings,
+    resourceTaskRequest,
+    new AbortController().signal,
+    missingCgroup.dependencies,
+  );
+  expect(cgroupResult).toMatchObject({
+    published: false,
+    cleanupVerified: false,
+    reservationReturned: false,
+    admissionClosed: true,
+  });
+  expect(missingCgroup.finalizePublication).not.toHaveBeenCalled();
+
+  const missingTaskCleanup = resourceTaskHarness({
+    readTaskResult: vi.fn(() => ({ status: 'succeeded', cleanupVerified: false, details: {} })),
+  });
+  const cleanupResult = await runResourceTask(
+    resourceTaskSettings,
+    resourceTaskRequest,
+    new AbortController().signal,
+    missingTaskCleanup.dependencies,
+  );
+  expect(cleanupResult).toMatchObject({
+    published: false,
+    cleanupVerified: false,
+    reservationReturned: false,
+    admissionClosed: true,
+  });
+  expect(missingTaskCleanup.finalizePublication).not.toHaveBeenCalled();
+});
+
+it('settles without publication when cancellation or the deadline wins before commit', async () => {
+  const abort = new AbortController();
+  abort.abort();
+  const cancelled = resourceTaskHarness();
+  await runResourceTask(
+    resourceTaskSettings,
+    resourceTaskRequest,
+    abort.signal,
+    cancelled.dependencies,
+  );
+  expect(cancelled.settleUnpublished).toHaveBeenCalledWith(
+    expect.any(String),
+    expect.any(String),
+    'cancelled',
+    'cancelled',
+    expect.any(Object),
+  );
+  expect(cancelled.finalizePublication).not.toHaveBeenCalled();
+
+  const deadline = resourceTaskHarness({
+    nowNs: vi.fn().mockReturnValueOnce(0n).mockReturnValue(2_000_000_000n),
+  });
+  await runResourceTask(
+    resourceTaskSettings,
+    resourceTaskRequest,
+    new AbortController().signal,
+    deadline.dependencies,
+  );
+  expect(deadline.settleUnpublished).toHaveBeenCalledWith(
+    expect.any(String),
+    expect.any(String),
+    'failed',
+    'deadline_exceeded',
+    expect.any(Object),
+  );
+  expect(deadline.finalizePublication).not.toHaveBeenCalled();
+});
+
+it('settles a task-runner transfer failure without publication', async () => {
+  const failedTransfer = resourceTaskHarness({
+    readTaskResult: vi.fn(() => ({
+      status: 'failed',
+      failureCode: 'execution_failed',
+      cleanupVerified: true,
+      details: { failure: 'stage copy rejected candidate' },
+    })),
+  });
+  await runResourceTask(
+    resourceTaskSettings,
+    resourceTaskRequest,
+    new AbortController().signal,
+    failedTransfer.dependencies,
+  );
+  expect(failedTransfer.settleUnpublished).toHaveBeenCalledWith(
+    expect.any(String),
+    expect.any(String),
+    'failed',
+    'execution_failed',
+    expect.objectContaining({
+      task: expect.objectContaining({ status: 'failed' }),
+    }),
+  );
+  expect(failedTransfer.finalizePublication).not.toHaveBeenCalled();
 });
 
 it('atomically replaces the formal artifact only at the publication commit point', () => {

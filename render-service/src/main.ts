@@ -103,6 +103,8 @@ export interface AppDeps {
   onEvent?: RenderEventSink;
   /** Runtime identity reported by health and copied into per-render metrics. */
   runtimeVersions?: RuntimeVersions;
+  /** The systemd resource executor fences video renders only; previews are disabled. */
+  resourceMode?: boolean;
 }
 
 interface PreviewPayload {
@@ -375,6 +377,17 @@ export function createApp(deps: AppDeps): Hono {
   });
 
   app.post('/preview', async (c) => {
+    // Resource mode cannot run Chromium here: this HTTP process is outside the
+    // per-task cgroup. Reject before inspecting or buffering the request body.
+    if (deps.resourceMode) {
+      return c.json(
+        {
+          error: 'Preview is unavailable while per-task resource budgets are enabled',
+          reason: 'resource_mode_unsupported',
+        },
+        503,
+      );
+    }
     const declared = Number(c.req.header('content-length') ?? '0');
     if (Number.isFinite(declared) && declared > previewMaxJsonBytes) {
       return c.json({ error: 'Upload too large' }, 413);
@@ -571,7 +584,7 @@ export async function startService(resourceExecutor?: RenderExecutor): Promise<v
 
   // Build the browser mount off the request path so the first preview does not
   // pay the cold esbuild cost while holding admission and execution permits.
-  await buildSlideClientBundle();
+  if (!resourceExecutor) await buildSlideClientBundle();
 
   const app = createApp({
     jobs,
@@ -581,6 +594,7 @@ export async function startService(resourceExecutor?: RenderExecutor): Promise<v
     // can't stack across a burst of admitted requests.
     extractionGate: new Semaphore(config.maxConcurrentExtractions),
     runtimeVersions,
+    resourceMode: resourceExecutor !== undefined,
   });
 
   // Ensure the scratch root exists before accepting work. On the documented

@@ -344,17 +344,24 @@ export async function waitForStarted(unit, resultPath, timeoutMs, dependencies =
   );
 }
 
-async function waitForStopped(unit, controlGroup, timeoutMs) {
-  const end = Date.now() + timeoutMs;
+export async function waitForStopped(unit, controlGroup, timeoutMs, dependencies = {}) {
+  const readUnit = dependencies.showUnit ?? showUnit;
+  const pathExists = dependencies.exists ?? existsSync;
+  const pause = dependencies.sleep ?? sleep;
+  const now = dependencies.now ?? Date.now;
+  const end = now() + timeoutMs;
   const cgroupPath = resolve('/sys/fs/cgroup', `.${controlGroup}`);
   let last;
-  while (Date.now() < end) {
-    last = await showUnit(unit);
+  while (now() < end) {
+    last = await readUnit(unit);
     const stopped = !last.found || last.ActiveState === 'inactive' || last.ActiveState === 'failed';
-    if (stopped && !existsSync(cgroupPath)) return { unit: last, cgroupRemoved: true };
-    await sleep(50);
+    if (stopped && !pathExists(cgroupPath)) return { unit: last, cgroupRemoved: true };
+    await pause(50);
   }
-  return { unit: last, cgroupRemoved: !existsSync(cgroupPath) };
+  const stopped = Boolean(
+    last && (!last.found || last.ActiveState === 'inactive' || last.ActiveState === 'failed'),
+  );
+  return { unit: last, cgroupRemoved: stopped && !pathExists(cgroupPath) };
 }
 
 async function stopUnit(unit) {
@@ -580,25 +587,40 @@ export function buildSystemdRunArguments(settings, unit, configPath, remainingMs
 }
 
 /** Run one already-admitted render in a transient systemd service. */
-export async function runResourceTask(settings, request, signal) {
-  const token = randomUUID().replaceAll('-', '');
+export async function runResourceTask(settings, request, signal, dependencies = {}) {
+  const nextId = dependencies.randomUUID ?? randomUUID;
+  const makeTaskDirectory = dependencies.createTaskDirectory ?? createTaskDirectory;
+  const writeConfig = dependencies.writeExclusiveJson ?? writeExclusiveJson;
+  const launchUnit = dependencies.exec ?? exec;
+  const awaitStarted = dependencies.waitForStarted ?? waitForStarted;
+  const readUnit = dependencies.showUnit ?? showUnit;
+  const awaitStopped = dependencies.waitForStopped ?? waitForStopped;
+  const stop = dependencies.stopUnit ?? stopUnit;
+  const resultExists = dependencies.exists ?? existsSync;
+  const readResult = dependencies.readTaskResult ?? readTaskResult;
+  const settle = dependencies.settleUnpublished ?? settleUnpublished;
+  const publish = dependencies.finalizePublication ?? finalizePublication;
+  const nowNs = dependencies.nowNs ?? (() => process.hrtime.bigint());
+  const pause = dependencies.sleep ?? sleep;
+  const nowMs = dependencies.nowMs ?? Date.now;
+  const token = nextId().replaceAll('-', '');
   const unit = `openmaic-render-${token}.service`;
   const taskDir = join(settings.stateRoot, `task-${token}`);
   // The worker receives absolute paths below this directory after setuid().
   // Execute-only access permits traversal but neither listing nor mutation;
   // request/result files remain root-private 0600.
-  createTaskDirectory(taskDir);
+  makeTaskDirectory(taskDir);
   const stagePath = join(request.projectDir, `.openmaic-resource-${token}.mp4`);
   const config = safeTaskConfig(settings, request, taskDir, stagePath);
   const configPath = join(taskDir, 'request.json');
-  writeExclusiveJson(configPath, config);
+  writeConfig(configPath, config);
 
   const remainingMs = Math.min(
     request.timeoutMs,
-    Number((BigInt(request.deadlineNs) - process.hrtime.bigint()) / 1_000_000n),
+    Number((BigInt(request.deadlineNs) - nowNs()) / 1_000_000n),
   );
   if (!Number.isSafeInteger(remainingMs) || remainingMs <= 0) {
-    return settleUnpublished(stagePath, taskDir, 'failed', 'deadline_exceeded', {
+    return settle(stagePath, taskDir, 'failed', 'deadline_exceeded', {
       notAdmitted: true,
     });
   }
@@ -611,15 +633,16 @@ export async function runResourceTask(settings, request, signal) {
   let deadlineReached = false;
   const abort = () => {
     abortRequested = true;
-    void stopUnit(unit);
+    void stop(unit);
   };
   const deadlineTimer = setTimeout(() => {
     deadlineReached = true;
-    void stopUnit(unit);
+    void stop(unit);
   }, remainingMs);
+  deadlineTimer.unref?.();
   signal.addEventListener('abort', abort, { once: true });
   try {
-    const launch = await exec('/usr/bin/systemd-run', args, {
+    const launch = await launchUnit('/usr/bin/systemd-run', args, {
       timeout: 15_000,
       maxBuffer: MAX_COMMAND_OUTPUT,
     });
@@ -628,25 +651,25 @@ export async function runResourceTask(settings, request, signal) {
       'Resource task launch accepted:',
       boundedText(JSON.stringify({ unit, stdout: boundedText(launch.stdout) })),
     );
-    started = await waitForStarted(unit, config.resultPath, 10_000);
-    if (abortRequested) await stopUnit(unit);
+    started = await awaitStarted(unit, config.resultPath, 10_000);
+    if (abortRequested) await stop(unit);
 
-    const end = Date.now() + remainingMs + 2 * settings.owner.cleanupTimeoutMs + 5000;
-    while (Date.now() < end) {
-      const state = await showUnit(unit);
+    const end = nowMs() + remainingMs + 2 * settings.owner.cleanupTimeoutMs + 5000;
+    while (nowMs() < end) {
+      const state = await readUnit(unit);
       if (!state.found || state.ActiveState === 'inactive' || state.ActiveState === 'failed') break;
-      if (abortRequested) await stopUnit(unit);
-      await sleep(50);
+      if (abortRequested) await stop(unit);
+      await pause(50);
     }
-    readback = await waitForStopped(
+    readback = await awaitStopped(
       unit,
       started.controlGroup,
       2 * settings.owner.cleanupTimeoutMs + 5000,
     );
   } catch (error) {
-    await stopUnit(unit);
+    await stop(unit);
     if (started)
-      readback = await waitForStopped(
+      readback = await awaitStopped(
         unit,
         started.controlGroup,
         2 * settings.owner.cleanupTimeoutMs + 5000,
@@ -679,7 +702,7 @@ export async function runResourceTask(settings, request, signal) {
     signal.removeEventListener('abort', abort);
   }
 
-  if (!readback?.cgroupRemoved || !existsSync(config.resultPath)) {
+  if (!readback?.cgroupRemoved || !resultExists(config.resultPath)) {
     return {
       status: abortRequested ? 'cancelled' : 'failed',
       failureCode: abortRequested
@@ -691,13 +714,13 @@ export async function runResourceTask(settings, request, signal) {
       cleanupVerified: false,
       reservationReturned: false,
       admissionClosed: true,
-      details: { missingTaskResult: !existsSync(config.resultPath), readback },
+      details: { missingTaskResult: !resultExists(config.resultPath), readback },
     };
   }
 
   let taskResult;
   try {
-    taskResult = readTaskResult(config.resultPath);
+    taskResult = readResult(config.resultPath);
   } catch (error) {
     return {
       status: 'failed',
@@ -725,9 +748,9 @@ export async function runResourceTask(settings, request, signal) {
       details: taskSettlementDetails(taskResult, readback),
     };
   }
-  const deadlineExpired = deadlineReached || process.hrtime.bigint() >= BigInt(request.deadlineNs);
+  const deadlineExpired = deadlineReached || nowNs() >= BigInt(request.deadlineNs);
   if (abortRequested || deadlineExpired || taskResult.status !== 'succeeded') {
-    return settleUnpublished(
+    return settle(
       stagePath,
       taskDir,
       abortRequested ? 'cancelled' : 'failed',
@@ -741,7 +764,7 @@ export async function runResourceTask(settings, request, signal) {
   }
 
   if (signal.aborted) {
-    return settleUnpublished(
+    return settle(
       stagePath,
       taskDir,
       'cancelled',
@@ -749,7 +772,7 @@ export async function runResourceTask(settings, request, signal) {
       taskSettlementDetails(taskResult, readback, { cancelledBeforePublish: true }),
     );
   }
-  return finalizePublication(
+  return publish(
     stagePath,
     request.outputPath,
     taskDir,

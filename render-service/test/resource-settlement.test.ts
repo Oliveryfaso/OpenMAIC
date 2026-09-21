@@ -6,6 +6,7 @@ import { RenderCoordinator } from '../src/render-coordinator.js';
 import { InMemoryJobStore } from '../src/job-store.js';
 import { createMemoryArtifactStore, createMemoryJobStore } from './support/fakes.js';
 import type { RenderExecutor } from '../src/render-executor.js';
+import type { ArtifactStore } from '../src/artifact-store.js';
 import type { RenderExecutionResult, RenderResourceSettlement } from '../src/types.js';
 const directories: string[] = [];
 const options = { fps: 30, quality: 'standard', format: 'mp4' } as const;
@@ -135,6 +136,71 @@ it.each([
     }
   },
 );
+
+it('preserves a committed publication when bookkeeping fails after a late cancel', async () => {
+  const jobs = createMemoryJobStore();
+  const paths = new Map<string, string>();
+  let enteredPut!: () => void;
+  const putStarted = new Promise<void>((resolve) => {
+    enteredPut = resolve;
+  });
+  let rejectPut!: (error: Error) => void;
+  const putBlocked = new Promise<never>((_resolve, reject) => {
+    rejectPut = reject;
+  });
+  const remove = vi.fn(async (id: string) => {
+    paths.delete(id);
+  });
+  const artifacts: ArtifactStore = {
+    async put(id, path) {
+      paths.set(id, path);
+      enteredPut();
+      return putBlocked;
+    },
+    async locate(id) {
+      const path = paths.get(id);
+      return path ? { kind: 'file', path } : null;
+    },
+    remove,
+  };
+  const resources: RenderResourceSettlement = {
+    published: true,
+    cleanupVerified: true,
+    reservationReturned: true,
+    admissionClosed: false,
+  };
+  const executor: RenderExecutor = {
+    async execute(request) {
+      await writeFile(request.outputPath, 'committed-before-bookkeeping');
+      return { status: 'succeeded', resources };
+    },
+  };
+  const coordinator = new RenderCoordinator(executor, jobs, artifacts, { onEvent: () => {} });
+  const dir = await directory();
+  const id = await coordinator.submit(coordinator.reserve('bookkeeping'), dir, options);
+  await putStarted;
+
+  expect(await coordinator.cancel(id)).toBe(true);
+  rejectPut(new Error('artifact registration failed'));
+
+  const job = await finish(jobs, id);
+  expect(job).toMatchObject({
+    status: 'failed',
+    failure: { code: 'execution_failed', message: 'artifact registration failed' },
+    resources,
+  });
+  expect(remove).not.toHaveBeenCalled();
+  await expect(artifacts.locate(id)).resolves.toEqual({
+    kind: 'file',
+    path: join(dir, 'output.mp4'),
+  });
+  await expect(readFile(join(dir, 'output.mp4'), 'utf8')).resolves.toBe(
+    'committed-before-bookkeeping',
+  );
+  await expect(access(dir)).resolves.toBeUndefined();
+  await coordinator.cleanupProject(dir);
+  await expect(access(dir)).rejects.toThrow();
+});
 
 it('rejects a queued job without launching when the owner becomes unavailable', async () => {
   const jobs = createMemoryJobStore();
