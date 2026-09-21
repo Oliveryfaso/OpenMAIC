@@ -210,14 +210,14 @@ DEFAULT_MODEL=openai:gpt-5.5
 
 ## 功能開關
 
-功能開關的值可設為 `true` 或 `1`，其他值都視為關閉。`NEXT_PUBLIC_*` 開關會在建置時編譯至用戶端，修改後需要重新建置：
+功能開關的值可設為 `true` 或 `1`；除非另有說明，其他值都視為關閉。`NEXT_PUBLIC_*` 開關會在建置時編譯至用戶端，修改後需要重新建置：
 
 ```bash
 # MAIC Editor（Pro 模式）
 NEXT_PUBLIC_MAIC_EDITOR_ENABLED=true
 
-# Pi 對話執行時
-NEXT_PUBLIC_PI_CHAT_ENABLED=true
+# Pi 對話執行時預設開啟；設為 false 或 0 可回復舊版鏈路
+NEXT_PUBLIC_PI_CHAT_ENABLED=false
 
 # Pi 播放態中的 PPT 與互動頁課件引用（建置時開關；不影響編輯態引用）
 NEXT_PUBLIC_COURSEWARE_REFERENCE_ENABLED=true

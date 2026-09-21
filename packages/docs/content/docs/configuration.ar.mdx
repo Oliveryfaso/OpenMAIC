@@ -210,14 +210,14 @@ DEFAULT_MODEL=openai:gpt-5.5
 
 ## feature flags (مفاتيح الميزات)
 
-تُعتبر القيم `true` أو `1` مفعلة، وأي قيمة أخرى معطلة. تُحقن متغيرات `NEXT_PUBLIC_*` في وقت البناء للعميل، ويجب إعادة البناء بعد تعديلها:
+تُعتبر القيم `true` أو `1` مفعلة، وما لم يُذكر خلاف ذلك تُعد أي قيمة أخرى معطلة. تُحقن متغيرات `NEXT_PUBLIC_*` في وقت البناء للعميل، ويجب إعادة البناء بعد تعديلها:
 
 ```bash
 # محرر MAIC (وضع Pro)
 NEXT_PUBLIC_MAIC_EDITOR_ENABLED=true
 
-# وقت تشغيل محادثة Pi
-NEXT_PUBLIC_PI_CHAT_ENABLED=true
+# محادثة Pi مفعلة افتراضيًا؛ استخدم false أو 0 للعودة إلى المسار القديم
+NEXT_PUBLIC_PI_CHAT_ENABLED=false
 
 # مراجع مواد PPT والمشاهد التفاعلية أثناء تشغيل Pi (علامة وقت البناء؛ لا تؤثر في مراجع وضع التحرير)
 NEXT_PUBLIC_COURSEWARE_REFERENCE_ENABLED=true
