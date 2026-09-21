@@ -216,8 +216,8 @@ Feature flags accept `true` or `1`; unless noted otherwise, all other values are
 # MAIC Editor (Pro mode)
 NEXT_PUBLIC_MAIC_EDITOR_ENABLED=true
 
-# Pi chat runtime is enabled by default; set false or 0 for legacy rollback
-NEXT_PUBLIC_PI_CHAT_ENABLED=false
+# Pi chat is enabled by default; uncomment the next line for legacy rollback
+# NEXT_PUBLIC_PI_CHAT_ENABLED=false
 
 # PPT and Interactive courseware references in Pi playback (build-time; editor references are separate)
 NEXT_PUBLIC_COURSEWARE_REFERENCE_ENABLED=true
@@ -234,6 +234,8 @@ NEXT_PUBLIC_ENABLE_VIDEO_EXPORT=true
 # Show the experimental PPTX import entry point
 NEXT_PUBLIC_ENABLE_PPTX_IMPORT=true
 ```
+
+Pi chat requires model tool/function calling. If the selected model or provider does not support tool calls, set `NEXT_PUBLIC_PI_CHAT_ENABLED=false` (or `0`) and rebuild to use the legacy chat path.
 
 PPTX import is still experimental, and its parsed output is not yet fully integrated into the classroom data flow. All `NEXT_PUBLIC_*` variables above are build-time flags. Docker deployments must also pass them as build args; setting them only as container runtime environment variables is not sufficient.
 
