@@ -492,9 +492,7 @@ export function createApp(deps: AppDeps): Hono {
         cleanupVerified: job.resources.cleanupVerified,
         reservationReturned: job.resources.reservationReturned,
         admissionClosed: job.resources.admissionClosed,
-        ...(job.resources.diagnosticCode
-          ? { diagnosticCode: job.resources.diagnosticCode }
-          : {}),
+        ...(job.resources.diagnosticCode ? { diagnosticCode: job.resources.diagnosticCode } : {}),
       },
       error: job.error,
       done: isTerminal(job.status),

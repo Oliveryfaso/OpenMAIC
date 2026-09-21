@@ -117,8 +117,7 @@ async function drain(path, timeoutMs) {
   let sentKill = false;
   while (Date.now() < end) {
     const snapshot = cgroupPids(path);
-    if (snapshot.readError)
-      return { drained: false, remaining: [], readError: snapshot.readError };
+    if (snapshot.readError) return { drained: false, remaining: [], readError: snapshot.readError };
     const others = snapshot.pids.filter((pid) => pid !== process.pid);
     if (others.length === 0) return { drained: true, remaining: [] };
     const elapsed = timeoutMs - (end - Date.now());
@@ -172,7 +171,8 @@ function validateConfig(config) {
   if (!lstatSync(project).isDirectory() || lstatSync(project).uid !== config.workerUid)
     throw new Error('Task project identity changed');
   for (const executable of [config.browserPath, config.ffmpegPath]) {
-    if (!lstatSync(realpathSync(executable)).isFile()) throw new Error('Configured tool is not a file');
+    if (!lstatSync(realpathSync(executable)).isFile())
+      throw new Error('Configured tool is not a file');
   }
   const allowedProducerEnvironment = new Set([
     'PRODUCER_MAX_WORKERS',
@@ -243,7 +243,10 @@ async function main() {
     projectMounted = true;
     command('/usr/bin/mount', ['-o', 'remount,bind,ro,nosuid,nodev', privateProject]);
     for (const path of ['tmp', 'home', 'out'])
-      command('/usr/bin/chown', [`${config.workerUid}:${config.workerGid}`, join(privateRoot, path)]);
+      command('/usr/bin/chown', [
+        `${config.workerUid}:${config.workerGid}`,
+        join(privateRoot, path),
+      ]);
 
     const workerEnvironment = {
       PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,

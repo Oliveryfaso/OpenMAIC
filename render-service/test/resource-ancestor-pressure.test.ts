@@ -30,9 +30,7 @@ it('attributes only local ancestor high/max/oom pressure, not victim counts', ()
 
 it('fails closed on missing counters, resets, identity changes and an active memory.high', () => {
   expect(() => compareAncestorPressure([row()], [row('high 0\nmax 0')])).toThrow('Missing');
-  expect(() =>
-    compareAncestorPressure([row('high 1\nmax 0\noom 0')], [row()]),
-  ).toThrow('reset');
+  expect(() => compareAncestorPressure([row('high 1\nmax 0\noom 0')], [row()])).toThrow('reset');
   expect(() => compareAncestorPressure([row()], [])).toThrow('identity');
   expect(
     compareAncestorPressure([row()], [{ ...row(), memoryCurrent: '4096', memoryHigh: '4096' }])

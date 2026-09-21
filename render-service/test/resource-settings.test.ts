@@ -89,9 +89,7 @@ it('requires a canonical root-owned non-writable state directory', () => {
 });
 it('requires execute-only traversal for the unprivileged task worker', () => {
   stats.set('/run/openmaic-resource', { uid: 0, mode: 0o711, type: 'directory' });
-  expect(() =>
-    assertRootOwnedWorkerTraversableDirectory('/run/openmaic-resource'),
-  ).not.toThrow();
+  expect(() => assertRootOwnedWorkerTraversableDirectory('/run/openmaic-resource')).not.toThrow();
   stats.get('/run/openmaic-resource')!.mode = 0o700;
   expect(() => assertRootOwnedWorkerTraversableDirectory('/run/openmaic-resource')).toThrow(
     'other-execute traversal',

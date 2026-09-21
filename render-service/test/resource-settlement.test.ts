@@ -122,9 +122,7 @@ it.each([
       kind: 'file',
       path: join(dir, 'output.mp4'),
     });
-    await expect(readFile(join(dir, 'output.mp4'), 'utf8')).resolves.toBe(
-      'published-after-cancel',
-    );
+    await expect(readFile(join(dir, 'output.mp4'), 'utf8')).resolves.toBe('published-after-cancel');
 
     if (admissionClosed) {
       await coordinator.cleanupProject(dir);

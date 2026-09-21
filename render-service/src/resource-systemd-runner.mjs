@@ -99,9 +99,9 @@ function errorRecord(error) {
 function missingProcess(error) {
   return Boolean(
     error &&
-      typeof error === 'object' &&
-      'code' in error &&
-      ['ENOENT', 'ESRCH'].includes(String(error.code)),
+    typeof error === 'object' &&
+    'code' in error &&
+    ['ENOENT', 'ESRCH'].includes(String(error.code)),
   );
 }
 
@@ -157,7 +157,11 @@ export function inspectMainPid(pid, controlGroup, dependencies = {}) {
   let exe;
   try {
     exe = realpath(join(base, 'exe'));
-    checks.exe = { result: exe === expectedExe ? 'match' : 'mismatch', expected: expectedExe, observed: exe };
+    checks.exe = {
+      result: exe === expectedExe ? 'match' : 'mismatch',
+      expected: expectedExe,
+      observed: exe,
+    };
   } catch (error) {
     checks.exe = {
       result: missingProcess(error) ? 'not_ready' : 'read_error',
@@ -320,11 +324,7 @@ export async function waitForStarted(unit, resultPath, timeoutMs, dependencies =
       last.status !== MAIN_PID_DIAGNOSTIC_CODES.fieldsNotReady &&
       last.status !== MAIN_PID_DIAGNOSTIC_CODES.startupTransient
     )
-      throw startupError(
-        'Transient task MainPID verification failed',
-        last.status,
-        last,
-      );
+      throw startupError('Transient task MainPID verification failed', last.status, last);
     if (resultExists(resultPath)) {
       const completed = { ...last, reason: 'task_result_exists_before_identity_verification' };
       log(unit, completed);
@@ -350,8 +350,7 @@ async function waitForStopped(unit, controlGroup, timeoutMs) {
   let last;
   while (Date.now() < end) {
     last = await showUnit(unit);
-    const stopped =
-      !last.found || last.ActiveState === 'inactive' || last.ActiveState === 'failed';
+    const stopped = !last.found || last.ActiveState === 'inactive' || last.ActiveState === 'failed';
     if (stopped && !existsSync(cgroupPath)) return { unit: last, cgroupRemoved: true };
     await sleep(50);
   }
@@ -474,14 +473,7 @@ function removeAndVerify(path, dependencies = {}) {
   }
 }
 
-function settleUnpublished(
-  stagePath,
-  taskDir,
-  status,
-  failureCode,
-  details,
-  dependencies = {},
-) {
+function settleUnpublished(stagePath, taskDir, status, failureCode, details, dependencies = {}) {
   const stageCleanup = removeAndVerify(stagePath, dependencies);
   const taskDirectoryCleanup = removeAndVerify(taskDir, dependencies);
   const cleanupVerified = stageCleanup.verified && taskDirectoryCleanup.verified;
@@ -509,9 +501,7 @@ export function taskSettlementDetails(task, readback, extra = {}) {
       ? { resourceAccounting: taskDetails.resourceAccounting }
       : {}),
     ...(taskDetails.residual ? { residual: taskDetails.residual } : {}),
-    ...(taskDetails.accountingFailure
-      ? { accountingFailure: taskDetails.accountingFailure }
-      : {}),
+    ...(taskDetails.accountingFailure ? { accountingFailure: taskDetails.accountingFailure } : {}),
     ...extra,
   };
 }
@@ -678,7 +668,9 @@ export async function runResourceTask(settings, request, signal) {
         : {}),
       details: {
         controllerFailure: boundedText(error instanceof Error ? error.message : error),
-        ...(error && typeof error === 'object' && 'details' in error ? { diagnostic: error.details } : {}),
+        ...(error && typeof error === 'object' && 'details' in error
+          ? { diagnostic: error.details }
+          : {}),
         platformCgroupRemoved: cleanupVerified,
       },
     };
@@ -733,8 +725,7 @@ export async function runResourceTask(settings, request, signal) {
       details: taskSettlementDetails(taskResult, readback),
     };
   }
-  const deadlineExpired =
-    deadlineReached || process.hrtime.bigint() >= BigInt(request.deadlineNs);
+  const deadlineExpired = deadlineReached || process.hrtime.bigint() >= BigInt(request.deadlineNs);
   if (abortRequested || deadlineExpired || taskResult.status !== 'succeeded') {
     return settleUnpublished(
       stagePath,
@@ -744,7 +735,7 @@ export async function runResourceTask(settings, request, signal) {
         ? 'cancelled'
         : deadlineExpired
           ? 'deadline_exceeded'
-          : taskResult.failureCode ?? 'execution_failed',
+          : (taskResult.failureCode ?? 'execution_failed'),
       taskSettlementDetails(taskResult, readback),
     );
   }

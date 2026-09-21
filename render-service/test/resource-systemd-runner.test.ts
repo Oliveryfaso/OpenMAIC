@@ -47,11 +47,13 @@ const aliveStat = `42 (resource task) S ${Array(18).fill('0').join(' ')} 98765 1
 function procError(code: string, message: string) {
   return Object.assign(new Error(message), { code });
 }
-function identityFixture(overrides: {
-  stat?: () => string;
-  cgroup?: () => string;
-  exe?: () => string;
-} = {}) {
+function identityFixture(
+  overrides: {
+    stat?: () => string;
+    cgroup?: () => string;
+    exe?: () => string;
+  } = {},
+) {
   return inspectMainPid(42, '/system.slice/task.service', {
     expectedExe: '/usr/bin/node',
     readFile(path: string) {
@@ -311,12 +313,19 @@ it('preserves published=true and quarantines when post-publication task cleanup 
   writeFileSync(stage, 'NEW');
   writeFileSync(output, 'OLD');
   writeFileSync(task, 'retained task evidence');
-  const result = finalizePublication(stage, output, task, { task: { status: 'succeeded' } }, {
-    remove(path: string, options: Parameters<typeof rmSync>[1]) {
-      if (path === task) throw Object.assign(new Error('task cleanup denied'), { code: 'EACCES' });
-      rmSync(path, options);
+  const result = finalizePublication(
+    stage,
+    output,
+    task,
+    { task: { status: 'succeeded' } },
+    {
+      remove(path: string, options: Parameters<typeof rmSync>[1]) {
+        if (path === task)
+          throw Object.assign(new Error('task cleanup denied'), { code: 'EACCES' });
+        rmSync(path, options);
+      },
     },
-  });
+  );
   expect(readFileSync(output, 'utf8')).toBe('NEW');
   expect(result).toMatchObject({
     status: 'succeeded',
@@ -343,11 +352,17 @@ it('removes and verifies staging before returning a reservation after publicatio
   writeFileSync(stage, 'NEW');
   writeFileSync(output, 'OLD');
   writeFileSync(task, 'task evidence');
-  const result = finalizePublication(stage, output, task, {}, {
-    publish() {
-      throw new Error('rename failed');
+  const result = finalizePublication(
+    stage,
+    output,
+    task,
+    {},
+    {
+      publish() {
+        throw new Error('rename failed');
+      },
     },
-  });
+  );
   expect(readFileSync(output, 'utf8')).toBe('OLD');
   expect(result).toMatchObject({
     status: 'failed',
@@ -372,15 +387,22 @@ it('quarantines a retained staging file after publication and staging cleanup bo
   writeFileSync(stage, 'NEW');
   writeFileSync(output, 'OLD');
   writeFileSync(task, 'task evidence');
-  const result = finalizePublication(stage, output, task, {}, {
-    publish() {
-      throw new Error('rename failed');
+  const result = finalizePublication(
+    stage,
+    output,
+    task,
+    {},
+    {
+      publish() {
+        throw new Error('rename failed');
+      },
+      remove(path: string, options: Parameters<typeof rmSync>[1]) {
+        if (path === stage)
+          throw Object.assign(new Error('stage cleanup denied'), { code: 'EACCES' });
+        rmSync(path, options);
+      },
     },
-    remove(path: string, options: Parameters<typeof rmSync>[1]) {
-      if (path === stage) throw Object.assign(new Error('stage cleanup denied'), { code: 'EACCES' });
-      rmSync(path, options);
-    },
-  });
+  );
   expect(readFileSync(output, 'utf8')).toBe('OLD');
   expect(readFileSync(stage, 'utf8')).toBe('NEW');
   expect(result).toMatchObject({

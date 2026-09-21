@@ -135,7 +135,8 @@ export function createResourceHandler({
       if (invoked) admissionClosed = true;
     }
     const cancelled = outcome.status === 'cancelled' || abort.signal.aborted;
-    const status = outcome.status === 'succeeded' ? 'succeeded' : cancelled ? 'cancelled' : 'failed';
+    const status =
+      outcome.status === 'succeeded' ? 'succeeded' : cancelled ? 'cancelled' : 'failed';
     const result = {
       status,
       ...(status === 'succeeded'

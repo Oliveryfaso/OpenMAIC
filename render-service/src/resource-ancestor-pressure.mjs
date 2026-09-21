@@ -28,14 +28,12 @@ export function compareAncestorPressure(previous, current) {
   const triggers = [];
   current.forEach((row, index) => {
     const before = previous[index];
-    if (!before || before.path !== row.path)
-      throw new Error('Ancestor pressure identity changed');
+    if (!before || before.path !== row.path) throw new Error('Ancestor pressure identity changed');
     for (const event of ['high', 'max', 'oom']) {
       const a = localCounter(before.memoryEventsLocal, event);
       const b = localCounter(row.memoryEventsLocal, event);
       if (b < a) throw new Error(`Ancestor memory ${event} counter reset`);
-      if (b > a)
-        triggers.push({ path: row.path, event, before: String(a), after: String(b) });
+      if (b > a) triggers.push({ path: row.path, event, before: String(a), after: String(b) });
     }
     const currentBytes = unsigned(row.memoryCurrent, 'ancestor memory.current');
     if (
@@ -130,9 +128,7 @@ export function createAncestorPressureMonitor(dependencies = {}) {
     if (failure) return false;
     try {
       const observation = compareAncestorPressure(baseline, readSnapshot());
-      return observation.triggers.length
-        ? fail('ancestor_memory_pressure', observation)
-        : true;
+      return observation.triggers.length ? fail('ancestor_memory_pressure', observation) : true;
     } catch (error) {
       return fail('ancestor_pressure_unverifiable', {
         error: String(error instanceof Error ? error.message : error).slice(0, 4096),

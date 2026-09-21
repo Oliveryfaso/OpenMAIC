@@ -1,10 +1,4 @@
-import {
-  lstatSync,
-  readFileSync,
-  readlinkSync,
-  readdirSync,
-  statSync,
-} from 'node:fs';
+import { lstatSync, readFileSync, readlinkSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 const MAX_PIDS = 4096;
@@ -63,8 +57,7 @@ function scanLinks(proc, directory, kind, device, references) {
   for (const name of names) {
     const path = join(root, name);
     if (!sameDevice(path, device)) continue;
-    if (references.length >= MAX_RECORDED)
-      throw new Error('Reference evidence exceeded its bound');
+    if (references.length >= MAX_RECORDED) throw new Error('Reference evidence exceeded its bound');
     references.push({ kind, handle: name, target: linkTarget(path) });
   }
 }
@@ -97,7 +90,11 @@ export function scanExternalReferences(privateRoot, taskCgroup, ownPid = process
       before = identity(proc);
     } catch (error) {
       if (gone(error)) continue;
-      errors.push({ pid, field: 'stat', error: bounded(error instanceof Error ? error.message : error) });
+      errors.push({
+        pid,
+        field: 'stat',
+        error: bounded(error instanceof Error ? error.message : error),
+      });
       if (errors.length >= MAX_RECORDED) break;
       continue;
     }
@@ -125,7 +122,8 @@ export function scanExternalReferences(privateRoot, taskCgroup, ownPid = process
       if (after.starttime !== before.starttime) continue;
       scannedPids += 1;
       for (const item of processReferences) {
-        if (references.length >= MAX_RECORDED) throw new Error('Reference evidence exceeded its bound');
+        if (references.length >= MAX_RECORDED)
+          throw new Error('Reference evidence exceeded its bound');
         references.push({ pid, starttime: before.starttime, ...item });
       }
     } catch (error) {

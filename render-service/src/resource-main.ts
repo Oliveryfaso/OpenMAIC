@@ -82,7 +82,9 @@ if (
 )
   throw new Error('Per-task resource budget exceeds the effective service capacity');
 if (readdirSync(value.stateRoot).length !== 0)
-  throw new Error('Resource state root is not empty; audit prior owner/task cleanup before restart');
+  throw new Error(
+    'Resource state root is not empty; audit prior owner/task cleanup before restart',
+  );
 mkdirSync(join(value.stateRoot, 'owner.lock'), { mode: 0o700 });
 const child = fork(
   fileURLToPath(new URL('./resource-owner.mjs', import.meta.url)),
