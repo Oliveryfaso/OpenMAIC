@@ -58,6 +58,34 @@ function makeBody(): StatelessChatRequest {
   } as StatelessChatRequest;
 }
 
+function makeInteractiveBody(html: string): StatelessChatRequest {
+  const body = makeBody();
+  body.storeState.outlines = [
+    {
+      id: 'outline-game',
+      type: 'interactive',
+      title: 'Word sorting',
+      description: 'Sort each word into the correct category.',
+      keyPoints: ['A new word appears every 3 seconds', 'Unsorted words leave after 12 seconds'],
+      order: 1,
+    },
+  ];
+  body.storeState.scenes = [
+    {
+      id: 'scene-game',
+      outlineId: 'outline-game',
+      stageId: 'stage-1',
+      title: 'Word sorting',
+      order: 1,
+      type: 'interactive',
+      updatedAt: 51,
+      content: { type: 'interactive', widgetType: 'game', html },
+    },
+  ];
+  body.storeState.currentSceneId = 'scene-game';
+  return body;
+}
+
 describe('Pi Director read_scene', () => {
   it('reads an exact scene id and returns evidence with provenance', async () => {
     const onEvidence = vi.fn();
@@ -199,5 +227,68 @@ describe('Pi Director read_scene', () => {
 
     expect(text).toContain('pbl payload is not exposed by read_scene v1');
     expect(text).not.toContain('SECRET_SOLUTION');
+  });
+
+  it('reads source-authored Interactive instructions without executing or exposing scripts and styles', async () => {
+    const body = makeInteractiveBody(`<!doctype html><html><head>
+      <style>.start-screen { display: none } STYLE_SECRET</style>
+    </head><body>
+      <section class="start-screen">
+        <p>Each word rolls away after 12 seconds — that costs a life.</p>
+        <p>Wrong box → −5 points, the word comes back.</p>
+      </section>
+      <output>Lives: 3</output>
+      <script>window.currentScore = 999; SCRIPT_SECRET</script>
+    </body></html>`);
+    const tool = buildReadSceneTool({ body });
+
+    const result = await tool.execute('read-game', { sceneId: 'scene-game' });
+    const text = result.content[0]?.type === 'text' ? result.content[0].text : '';
+
+    expect(result.details).toMatchObject({ status: 'ok', sceneId: 'scene-game' });
+    expect(text).toContain('课件源码中的静态说明');
+    expect(text).toContain('Each word rolls away after 12 seconds — that costs a life.');
+    expect(text).toContain('Wrong box → −5 points, the word comes back.');
+    expect(text).toContain('Lives: 3');
+    expect(text).toContain('authored default or placeholder values');
+    expect(text).toContain('does not prove what is currently visible, selected, or happening');
+    expect(text).not.toContain('STYLE_SECRET');
+    expect(text).not.toContain('SCRIPT_SECRET');
+    expect(text).not.toContain('window.currentScore');
+    expect(text).not.toContain('<script');
+  });
+
+  it('retains a source-authored rule written directly under body', async () => {
+    const body = makeInteractiveBody(`<!doctype html><html><body>
+      Wrong box: lose 5 points.<button>Start</button>
+      <script>DIRECT_SCRIPT_SECRET</script>
+    </body></html>`);
+    const tool = buildReadSceneTool({ body });
+
+    const result = await tool.execute('read-direct-body-text', { sceneId: 'scene-game' });
+    const text = result.content[0]?.type === 'text' ? result.content[0].text : '';
+
+    expect(result.details).toMatchObject({ status: 'ok', sceneId: 'scene-game' });
+    expect(text).toContain('Wrong box: lose 5 points.');
+    expect(text).toContain('Start');
+    expect(text).not.toContain('DIRECT_SCRIPT_SECRET');
+  });
+
+  it('keeps the existing fail-without-truncation scene evidence budget', async () => {
+    const onEvidence = vi.fn();
+    const body = makeInteractiveBody(
+      `<!doctype html><html><body><main>${'A'.repeat(25_000)}</main></body></html>`,
+    );
+    const tool = buildReadSceneTool({ body, onEvidence });
+
+    const result = await tool.execute('read-large-game', { sceneId: 'scene-game' });
+    const text = result.content[0]?.type === 'text' ? result.content[0].text : '';
+
+    expect((result as { isError?: boolean }).isError).toBe(true);
+    expect(result.details).toMatchObject({ status: 'too_large', truncated: false });
+    expect(text).toContain('too large for read_scene v1');
+    expect(text).toContain('not silently truncated');
+    expect(text).not.toContain('AAAA');
+    expect(onEvidence).not.toHaveBeenCalled();
   });
 });

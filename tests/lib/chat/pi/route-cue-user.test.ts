@@ -3,7 +3,9 @@ import type { NextRequest } from 'next/server';
 import { convertToLlm } from '@earendil-works/pi-agent-core';
 
 const PI_CHAT_FLAG = 'NEXT_PUBLIC_PI_CHAT_ENABLED';
+const COURSEWARE_REFERENCE_FLAG = 'NEXT_PUBLIC_COURSEWARE_REFERENCE_ENABLED';
 let originalPiChatFlag: string | undefined;
+let originalCoursewareReferenceFlag: string | undefined;
 
 type MockTool = {
   name: string;
@@ -114,6 +116,63 @@ function makeBody() {
     },
     apiKey: '',
     model: 'test:model',
+  };
+}
+
+function makeInteractiveWordGameBody(opts: { declaresStateInterface?: boolean } = {}) {
+  const body = makeBody();
+  return {
+    ...body,
+    messages: [
+      {
+        id: 'user-1',
+        role: 'user',
+        parts: [{ type: 'text', text: '放错分类会怎样？十二秒没分拣又会怎样？' }],
+      },
+    ],
+    storeState: {
+      ...body.storeState,
+      outlines: [
+        {
+          id: 'outline-game',
+          type: 'interactive',
+          title: 'Word sorting',
+          description: 'Sort each word into the correct category.',
+          keyPoints: [
+            'A new word appears every 3 seconds',
+            'Unsorted words leave after 12 seconds',
+          ],
+          order: 1,
+        },
+      ],
+      scenes: [
+        {
+          id: 'scene-1',
+          outlineId: 'outline-game',
+          stageId: 'stage-1',
+          title: 'Word sorting',
+          order: 1,
+          type: 'interactive',
+          content: {
+            type: 'interactive',
+            widgetType: 'game',
+            html: `<!doctype html><html><head>
+              <style>.start-screen { display: none } STYLE_SECRET</style>
+            </head><body>
+              <main id="experiment" ${opts.declaresStateInterface ? 'data-maic-observation' : ''}>
+                <section class="start-screen">
+                  <p>Each word rolls away after 12 seconds — that costs a life.</p>
+                  <p>Wrong box → −5 points, the word comes back.</p>
+                </section>
+                <output>Lives: 3</output>
+              </main>
+              <script>window.currentScore = 999; SCRIPT_SECRET</script>
+            </body></html>`,
+          },
+        },
+      ],
+      currentSceneId: 'scene-1',
+    },
   };
 }
 
@@ -448,7 +507,9 @@ function mockDirectorWithFailedSceneRead() {
 describe('POST /api/chat/pi cue_user', () => {
   beforeEach(() => {
     originalPiChatFlag = process.env[PI_CHAT_FLAG];
+    originalCoursewareReferenceFlag = process.env[COURSEWARE_REFERENCE_FLAG];
     process.env[PI_CHAT_FLAG] = 'true';
+    process.env[COURSEWARE_REFERENCE_FLAG] = 'false';
     vi.resetModules();
     mocks.resolveModel.mockReset();
     mocks.buildAgent.mockReset();
@@ -470,6 +531,11 @@ describe('POST /api/chat/pi cue_user', () => {
       delete process.env[PI_CHAT_FLAG];
     } else {
       process.env[PI_CHAT_FLAG] = originalPiChatFlag;
+    }
+    if (originalCoursewareReferenceFlag === undefined) {
+      delete process.env[COURSEWARE_REFERENCE_FLAG];
+    } else {
+      process.env[COURSEWARE_REFERENCE_FLAG] = originalCoursewareReferenceFlag;
     }
   });
 
@@ -541,6 +607,58 @@ describe('POST /api/chat/pi cue_user', () => {
     });
     expect(captured.callAgentResults[1]?.details).not.toHaveProperty('sceneEvidence');
     expect(doneEvent?.data.totalAgents).toBe(2);
+  });
+
+  it('delivers W3/W4 static source rules through read_scene to Teacher without a reference or state interface', async () => {
+    const captured = {
+      childPrompts: [] as string[],
+      callAgentResults: [] as Array<Record<string, unknown>>,
+    };
+    mockDirectorReadSceneDelegation(captured);
+
+    const { POST } = await import('@/app/api/chat/pi/route');
+    const response = await POST(makeRequest(makeInteractiveWordGameBody()));
+    await readSseEvents(response);
+
+    expect(response.status).toBe(200);
+    expect(captured.childPrompts[0]).toContain('课件源码中的静态说明');
+    expect(captured.childPrompts[0]).toContain(
+      'Each word rolls away after 12 seconds — that costs a life.',
+    );
+    expect(captured.childPrompts[0]).toContain('Wrong box → −5 points, the word comes back.');
+    expect(captured.childPrompts[0]).toContain('authored default or placeholder values');
+    expect(captured.childPrompts[0]).not.toContain('PAGE-REPORTED STATE');
+    expect(captured.childPrompts[0]).not.toContain('SCRIPT_SECRET');
+    expect(captured.childPrompts[0]).not.toContain('STYLE_SECRET');
+    expect(captured.childPrompts[1]).not.toContain('课件源码中的静态说明');
+  });
+
+  it('keeps static rules separate from unavailable current state in Teacher evidence', async () => {
+    process.env[COURSEWARE_REFERENCE_FLAG] = 'true';
+    vi.resetModules();
+    const captured = {
+      childPrompts: [] as string[],
+      callAgentResults: [] as Array<Record<string, unknown>>,
+    };
+    mockDirectorReadSceneDelegation(captured);
+
+    const { POST } = await import('@/app/api/chat/pi/route');
+    const response = await POST(
+      makeRequest(makeInteractiveWordGameBody({ declaresStateInterface: true })),
+    );
+    await readSseEvents(response);
+
+    const teacherEvidence = captured.childPrompts[0] ?? '';
+    expect(response.status).toBe(200);
+    expect(teacherEvidence).toContain('课件源码中的静态说明');
+    expect(teacherEvidence).toContain('Wrong box → −5 points, the word comes back.');
+    expect(teacherEvidence).toContain('PAGE-REPORTED STATE');
+    expect(teacherEvidence).toContain('"status":"unavailable","reason":"not-sampled"');
+    expect(teacherEvidence).toContain(
+      'Explicit static source instructions may still support general task or rule explanations',
+    );
+    expect(teacherEvidence).toContain('never prove what is currently visible or happening');
+    expect(teacherEvidence).not.toContain('window.currentScore');
   });
 
   it('does not duplicate cue_user when coordinator explicitly cues before fallback', async () => {

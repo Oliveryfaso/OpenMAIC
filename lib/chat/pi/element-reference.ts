@@ -275,15 +275,21 @@ export class ElementReferenceValidationError extends Error {
   }
 }
 
-function compactInteractiveSourceHtml(sourceHtml: string): string {
+function compactInteractiveSourceHtml(
+  sourceHtml: string,
+  opts: { preserveDocumentBodyText?: boolean } = {},
+): string {
   let retainedNodes = 0;
   let sourceAttributes = 0;
   let inspectedAttributeUnits = 0;
   let retainedUnits = 0;
 
-  const isExcludedParent = (node: DefaultTreeAdapterMap['parentNode']): boolean =>
-    defaultTreeAdapter.isElementNode(node) &&
-    isInteractiveReferenceExcludedTag(defaultTreeAdapter.getTagName(node));
+  const isExcludedTextParent = (node: DefaultTreeAdapterMap['parentNode']): boolean => {
+    if (!defaultTreeAdapter.isElementNode(node)) return false;
+    const tagName = defaultTreeAdapter.getTagName(node);
+    if (opts.preserveDocumentBodyText && tagName.toLowerCase() === 'body') return false;
+    return isInteractiveReferenceExcludedTag(tagName);
+  };
 
   const accountNode = (): void => {
     retainedNodes += 1;
@@ -401,11 +407,11 @@ function compactInteractiveSourceHtml(sourceHtml: string): string {
       // Discard it in the compaction pass instead of retaining it for linkedom.
     },
     insertText(parentNode, text) {
-      if (isExcludedParent(parentNode)) return;
+      if (isExcludedTextParent(parentNode)) return;
       defaultTreeAdapter.insertText(parentNode, text);
     },
     insertTextBefore(parentNode, text, referenceNode) {
-      if (isExcludedParent(parentNode)) return;
+      if (isExcludedTextParent(parentNode)) return;
       defaultTreeAdapter.insertTextBefore(parentNode, text, referenceNode);
     },
   };
@@ -1048,6 +1054,29 @@ function sanitizeInteractiveSubtree(element: Element): Element {
     }
   }
   return clone;
+}
+
+/**
+ * Extract source-authored text from an Interactive HTML document without
+ * executing it. This deliberately shares the component-reference parser and
+ * exclusion policy so whole-scene evidence cannot retain script/style/template
+ * payloads through a second, looser HTML path.
+ */
+export function extractInteractiveStaticSourceText(sourceHtml: string): string {
+  if (sourceHtml.length > INTERACTIVE_SOURCE_HTML_LIMIT) {
+    throw new ElementReferenceValidationError(
+      `interactive source document exceeds the ${INTERACTIVE_SOURCE_HTML_LIMIT}-unit parse limit`,
+    );
+  }
+  if (sourceHtml.trim().length === 0) return '';
+
+  const compactSourceHtml = compactInteractiveSourceHtml(sourceHtml, {
+    preserveDocumentBodyText: true,
+  });
+  const { document: parsedDocument } = parseHTML(compactSourceHtml);
+  const document = parsedDocument as unknown as Document;
+  const sourceRoot = document.body ?? document.documentElement;
+  return sourceRoot ? normalizeStaticText(sanitizeInteractiveSubtree(sourceRoot)) : '';
 }
 
 function findSourceLabel(document: Document, element: Element): string | undefined {
