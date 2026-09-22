@@ -1073,11 +1073,22 @@ export function extractInteractiveStaticSourceText(sourceHtml: string): string {
   }
   if (sourceHtml.trim().length === 0) return '';
 
-  const compactSourceHtml = compactInteractiveSourceHtml(sourceHtml, {
-    preserveDocumentBodyText: true,
-  });
-  const { document: parsedDocument } = parseHTML(compactSourceHtml);
-  const document = parsedDocument as unknown as Document;
+  let document: Document;
+  try {
+    const compactSourceHtml = compactInteractiveSourceHtml(sourceHtml, {
+      preserveDocumentBodyText: true,
+    });
+    const { document: parsedDocument } = parseHTML(compactSourceHtml);
+    document = parsedDocument as unknown as Document;
+  } catch (error) {
+    // Both parser passes can reject malformed authored HTML with ordinary
+    // errors (e.g. parse5's RangeError for lone surrogates). Keep those on the
+    // same unavailable-source path as our explicit resource-limit failures.
+    if (error instanceof ElementReferenceValidationError) throw error;
+    throw new ElementReferenceValidationError(
+      'interactive source document could not be parsed safely',
+    );
+  }
   const sourceRoot = document.body ?? document.documentElement;
   return sourceRoot
     ? normalizeStaticText(sanitizeInteractiveSubtree(sourceRoot), STATIC_SOURCE_ITEM_SEPARATOR_TAGS)
