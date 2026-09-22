@@ -1,4 +1,13 @@
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  renameSync,
+  symlinkSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -14,6 +23,7 @@ import {
   taskSettlementDetails,
   waitForStarted,
   waitForStopped,
+  settleUnpublished,
 } from '../src/resource-systemd-runner.mjs';
 import { processIdentity } from '../src/resource-reference-scan.mjs';
 
@@ -409,6 +419,7 @@ const resourceTaskRequest = {
   id: 'job-1',
   projectDir: '/projects/job-1',
   outputPath: '/projects/job-1/output.mp4',
+  projectIdentity: { dev: 101, ino: 202 },
   options: { fps: 30, quality: 'standard', format: 'mp4' },
   timeoutMs: 1000,
   deadlineNs: '1000000000',
@@ -424,6 +435,16 @@ it('publishes only after the production owner observes cgroup removal and task c
   );
   expect(result).toMatchObject({ status: 'succeeded', published: true });
   expect(harness.finalizePublication).toHaveBeenCalledOnce();
+  expect(harness.dependencies.writeExclusiveJson).toHaveBeenCalledWith(
+    expect.any(String),
+    expect.objectContaining({ projectIdentity: resourceTaskRequest.projectIdentity }),
+  );
+  expect(harness.finalizePublication).toHaveBeenCalledWith(
+    expect.any(String),
+    resourceTaskRequest.outputPath,
+    expect.any(String),
+    expect.objectContaining({ projectIdentity: resourceTaskRequest.projectIdentity }),
+  );
   expect(harness.settleUnpublished).not.toHaveBeenCalled();
 });
 
@@ -478,7 +499,7 @@ it('settles without publication when cancellation or the deadline wins before co
     expect.any(String),
     'cancelled',
     'cancelled',
-    expect.any(Object),
+    expect.objectContaining({ projectIdentity: resourceTaskRequest.projectIdentity }),
   );
   expect(cancelled.finalizePublication).not.toHaveBeenCalled();
 
@@ -496,7 +517,7 @@ it('settles without publication when cancellation or the deadline wins before co
     expect.any(String),
     'failed',
     'deadline_exceeded',
-    expect.any(Object),
+    expect.objectContaining({ projectIdentity: resourceTaskRequest.projectIdentity }),
   );
   expect(deadline.finalizePublication).not.toHaveBeenCalled();
 });
@@ -523,6 +544,7 @@ it('settles a task-runner transfer failure without publication', async () => {
     'execution_failed',
     expect.objectContaining({
       task: expect.objectContaining({ status: 'failed' }),
+      projectIdentity: resourceTaskRequest.projectIdentity,
     }),
   );
   expect(failedTransfer.finalizePublication).not.toHaveBeenCalled();
@@ -535,7 +557,7 @@ it('atomically replaces the formal artifact only at the publication commit point
   const output = join(root, 'output.mp4');
   writeFileSync(stage, 'NEW');
   writeFileSync(output, 'OLD');
-  expect(publishStagedArtifact(stage, output)).toEqual({ directoryFsync: true });
+  expect(publishStagedArtifact(stage, output, statSync(root))).toEqual({ directoryFsync: true });
   expect(readFileSync(output, 'utf8')).toBe('NEW');
 });
 
@@ -544,7 +566,9 @@ it('preserves the old formal artifact when publication cannot reach rename', () 
   roots.push(root);
   const output = join(root, 'output.mp4');
   writeFileSync(output, 'OLD');
-  expect(() => publishStagedArtifact(join(root, 'missing-stage.mp4'), output)).toThrow();
+  expect(() =>
+    publishStagedArtifact(join(root, 'missing-stage.mp4'), output, statSync(root)),
+  ).toThrow();
   expect(readFileSync(output, 'utf8')).toBe('OLD');
 });
 
@@ -561,7 +585,7 @@ it('preserves published=true and quarantines when post-publication task cleanup 
     stage,
     output,
     task,
-    { task: { status: 'succeeded' } },
+    { task: { status: 'succeeded' }, projectIdentity: statSync(root) },
     {
       remove(path: string, options: Parameters<typeof rmSync>[1]) {
         if (path === task)
@@ -600,7 +624,7 @@ it('removes and verifies staging before returning a reservation after publicatio
     stage,
     output,
     task,
-    {},
+    { projectIdentity: statSync(root) },
     {
       publish() {
         throw new Error('rename failed');
@@ -635,15 +659,13 @@ it('quarantines a retained staging file after publication and staging cleanup bo
     stage,
     output,
     task,
-    {},
+    { projectIdentity: statSync(root) },
     {
       publish() {
         throw new Error('rename failed');
       },
-      remove(path: string, options: Parameters<typeof rmSync>[1]) {
-        if (path === stage)
-          throw Object.assign(new Error('stage cleanup denied'), { code: 'EACCES' });
-        rmSync(path, options);
+      unlink() {
+        throw Object.assign(new Error('stage cleanup denied'), { code: 'EACCES' });
       },
     },
   );
@@ -710,4 +732,169 @@ it('keeps task accounting separate and visible at the product settlement level',
   expect(taskSettlementDetails(failedCollection, { cgroupRemoved: true })).not.toHaveProperty(
     'residual',
   );
+});
+
+it('never traverses a directory planted at the unpublished staging path', () => {
+  const root = mkdtempSync(join(tmpdir(), 'resource-stage-directory-'));
+  roots.push(root);
+  const stage = join(root, 'stage.mp4');
+  const output = join(root, 'output.mp4');
+  const task = join(root, 'task');
+  mkdirSync(stage);
+  writeFileSync(join(stage, 'sentinel'), 'KEEP');
+  writeFileSync(output, 'OLD');
+  symlinkSync(output, join(stage, 'external-link'));
+  mkdirSync(task);
+  const remove = vi.fn(rmSync);
+  const result = finalizePublication(
+    stage,
+    output,
+    task,
+    { projectIdentity: statSync(root) },
+    {
+      publish() {
+        throw new Error('transfer/publication failed');
+      },
+      remove,
+    },
+  );
+  expect(readFileSync(join(stage, 'sentinel'), 'utf8')).toBe('KEEP');
+  expect(readFileSync(output, 'utf8')).toBe('OLD');
+  expect(remove).toHaveBeenCalledTimes(1);
+  expect(remove).toHaveBeenCalledWith(task, { recursive: true, force: true });
+  expect(result).toMatchObject({
+    status: 'failed',
+    published: false,
+    cleanupVerified: false,
+    reservationReturned: false,
+    admissionClosed: true,
+    details: { stageCleanup: { verified: false, remains: true } },
+  });
+});
+
+it('refuses publication through a symlink project directory', () => {
+  const root = mkdtempSync(join(tmpdir(), 'resource-publish-symlink-'));
+  roots.push(root);
+  const project = join(root, 'project');
+  mkdirSync(project);
+  writeFileSync(join(project, 'stage'), 'NEW');
+  writeFileSync(join(project, 'output'), 'OLD');
+  const alias = join(root, 'alias');
+  symlinkSync(project, alias);
+  expect(() =>
+    publishStagedArtifact(join(alias, 'stage'), join(alias, 'output'), statSync(project)),
+  ).toThrow();
+  expect(readFileSync(join(project, 'output'), 'utf8')).toBe('OLD');
+  expect(readFileSync(join(project, 'stage'), 'utf8')).toBe('NEW');
+});
+
+it('rejects a different project inode at publication after request validation', () => {
+  const root = mkdtempSync(join(tmpdir(), 'resource-publish-replacement-'));
+  roots.push(root);
+  const project = join(root, 'project');
+  mkdirSync(project);
+  const expected = statSync(project);
+  renameSync(project, join(root, 'original'));
+  mkdirSync(project);
+  writeFileSync(join(project, 'stage'), 'NEW');
+  writeFileSync(join(project, 'output'), 'OLD');
+  expect(() =>
+    publishStagedArtifact(join(project, 'stage'), join(project, 'output'), expected),
+  ).toThrow(/identity/);
+  expect(readFileSync(join(project, 'output'), 'utf8')).toBe('OLD');
+});
+
+it.each(['directory', 'symlink', 'missing', 'missing-identity'])(
+  'quarantines publication and every unpublished settlement when project identity is %s',
+  (replacement) => {
+    const root = mkdtempSync(join(tmpdir(), 'resource-parent-replaced-'));
+    roots.push(root);
+    const project = join(root, 'project');
+    const original = join(root, 'original');
+    const other = join(root, 'other');
+    const task = join(root, 'task');
+    mkdirSync(project);
+    mkdirSync(other);
+    mkdirSync(task);
+    writeFileSync(join(project, 'stage'), 'ORIGINAL');
+    writeFileSync(join(project, 'output'), 'OLD');
+    writeFileSync(join(other, 'stage'), 'UNRELATED');
+    const identity = statSync(project);
+    renameSync(project, original);
+    if (replacement === 'symlink') symlinkSync(other, project);
+    else if (replacement !== 'missing') mkdirSync(project);
+    const details = replacement === 'missing-identity' ? {} : { projectIdentity: identity };
+    const unlink = vi.fn();
+    const remove = vi.fn();
+    const lstat = vi.fn(() => {
+      throw Object.assign(new Error('absent'), { code: 'ENOENT' });
+    });
+    const deps = { unlink, remove, lstat };
+    const results = [
+      finalizePublication(join(project, 'stage'), join(project, 'output'), task, details, deps),
+      ...['cancelled', 'deadline_exceeded', 'execution_failed'].map((reason) =>
+        settleUnpublished(join(project, 'stage'), task, 'failed', reason, details, deps),
+      ),
+    ];
+    for (const result of results)
+      expect(result).toMatchObject({
+        published: false,
+        cleanupVerified: false,
+        reservationReturned: false,
+        admissionClosed: true,
+        details: {
+          stageCleanup: { projectIdentityVerified: false },
+          taskDirectoryCleanup: { skipped: 'project_identity_unverified' },
+        },
+      });
+    expect(unlink).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+    expect(lstat).not.toHaveBeenCalled();
+    expect(readFileSync(join(original, 'stage'), 'utf8')).toBe('ORIGINAL');
+    expect(readFileSync(join(original, 'output'), 'utf8')).toBe('OLD');
+    expect(readFileSync(join(other, 'stage'), 'utf8')).toBe('UNRELATED');
+    expect(statSync(task).isDirectory()).toBe(true);
+  },
+);
+
+it('retains trusted identity on pre-launch expiry and late cancellation settlement', async () => {
+  const expired = resourceTaskHarness({ nowNs: () => 2_000_000_000n });
+  await runResourceTask(
+    resourceTaskSettings,
+    resourceTaskRequest,
+    new AbortController().signal,
+    expired.dependencies,
+  );
+  expect(expired.settleUnpublished).toHaveBeenCalledWith(
+    expect.any(String),
+    expect.any(String),
+    'failed',
+    'deadline_exceeded',
+    expect.objectContaining({
+      notAdmitted: true,
+      projectIdentity: resourceTaskRequest.projectIdentity,
+    }),
+  );
+  const abort = new AbortController();
+  const late = resourceTaskHarness({
+    nowNs: vi
+      .fn()
+      .mockReturnValueOnce(0n)
+      .mockImplementation(() => {
+        abort.abort();
+        return 0n;
+      }),
+  });
+  await runResourceTask(resourceTaskSettings, resourceTaskRequest, abort.signal, late.dependencies);
+  expect(late.settleUnpublished).toHaveBeenCalledWith(
+    expect.any(String),
+    expect.any(String),
+    'cancelled',
+    'cancelled',
+    expect.objectContaining({
+      cancelledBeforePublish: true,
+      projectIdentity: resourceTaskRequest.projectIdentity,
+    }),
+  );
+  expect(late.finalizePublication).not.toHaveBeenCalled();
 });

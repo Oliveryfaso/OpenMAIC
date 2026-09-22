@@ -86,10 +86,12 @@ export function createResourceHandler({
         throw new Error('Invalid task timeout');
       if (!validOptions(message.options)) throw new Error('Invalid render options');
       const project = realpathSync(message.projectDir);
+      const projectIdentity = lstatSync(project);
       if (
         project !== message.projectDir ||
         dirname(project) !== projectRoot ||
-        lstatSync(project).uid !== settings.owner.workerUid ||
+        !projectIdentity.isDirectory() ||
+        projectIdentity.uid !== settings.owner.workerUid ||
         message.outputPath !== join(project, 'output.mp4') ||
         resolve(message.outputPath) !== message.outputPath
       )
@@ -103,7 +105,12 @@ export function createResourceHandler({
       invoked = true;
       outcome = await taskRunner(
         settings,
-        { ...message, projectDir: project, timeoutMs: remaining },
+        {
+          ...message,
+          projectDir: project,
+          projectIdentity: { dev: projectIdentity.dev, ino: projectIdentity.ino },
+          timeoutMs: remaining,
+        },
         abort.signal,
       );
       if (outcome.admissionClosed) admissionClosed = true;

@@ -1,5 +1,9 @@
 import {
   chmodSync,
+  mkdirSync,
+  renameSync,
+  statSync,
+  fstatSync,
   existsSync,
   lstatSync,
   mkdtempSync,
@@ -15,6 +19,7 @@ import { PassThrough } from 'node:stream';
 import { afterEach, expect, it, vi } from 'vitest';
 import { copyStage } from '../src/resource-stage-copy.mjs';
 import {
+  bindProjectDirectory,
   buildStageCopyArguments,
   closeoutTask,
   transferCandidate,
@@ -258,7 +263,7 @@ it('does not transfer when descendant drain or reference evidence fails', async 
       .fn()
       .mockResolvedValueOnce({ drained: false, remaining: [42] })
       .mockResolvedValueOnce({ drained: true, remaining: [] }),
-    scanReferences: vi.fn(),
+    scanReferences: vi.fn(() => ({ status: 'CLEAR', references: [], errors: [] })),
     transfer,
     command: vi.fn(),
     remove: vi.fn(),
@@ -324,4 +329,86 @@ it('settles a transfer failure without reporting task success', async () => {
     cleanupVerified: true,
     details: { failure: 'stage copy rejected candidate' },
   });
+});
+
+const validCopyEvidence = {
+  bytes: 12,
+  sourceDevice: 1,
+  destinationDevice: 2,
+  uid: 1001,
+  gid: 1002,
+  mode: 0o600,
+};
+it.each([
+  ['nonzero exit', JSON.stringify(validCopyEvidence), 1],
+  ['malformed JSON', '{', 0],
+  ['null evidence', 'null', 0],
+  ...Object.entries({
+    bytes: 0,
+    uid: 0,
+    gid: 0,
+    mode: 0o777,
+    sourceDevice: '1',
+    destinationDevice: '2',
+  }).map(([key, value]) => [key, JSON.stringify({ ...validCopyEvidence, [key]: value }), 0]),
+  ['same device', JSON.stringify({ ...validCopyEvidence, destinationDevice: 1 }), 0],
+])('rejects %s without falling back to a root copy', async (_name, output, code) => {
+  const directory = root();
+  const candidate = join(directory, 'candidate');
+  const stage = join(directory, 'stage');
+  writeFileSync(candidate, 'bytes accessible to the parent');
+  const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), pid: 42 });
+  const spawn = vi.fn(() => child);
+  const onChild = vi.fn();
+  const result = transferCandidate({ workerUid: 1001, workerGid: 1002 }, candidate, stage, {
+    spawn,
+    onChild,
+  });
+  expect(onChild).toHaveBeenCalledWith(child);
+  child.stdout.end(String(output));
+  child.emit('close', code, null);
+  await expect(result).rejects.toThrow();
+  expect(spawn).toHaveBeenCalledTimes(1);
+  expect(onChild).toHaveBeenLastCalledWith(undefined);
+  expect(existsSync(stage)).toBe(false);
+});
+
+it.each([
+  { ...identity, getuid: () => testUid + 1 },
+  { ...identity, getgid: () => testGid + 1 },
+  { ...identity, getgroups: () => [testGid, testGid + 1] },
+])('refuses copying before file access when worker identity is wrong', (wrongIdentity) => {
+  const directory = root();
+  const candidate = join(directory, 'candidate');
+  const stage = join(directory, 'stage');
+  writeFileSync(candidate, 'candidate');
+  expect(() => copyStage(candidate, stage, testUid, testGid, wrongIdentity)).toThrow(
+    /identity|groups/,
+  );
+  expect(existsSync(stage)).toBe(false);
+});
+
+it('binds an inherited directory descriptor and rejects a replacement inode or symlink', () => {
+  const directory = root();
+  const project = join(directory, 'project');
+  mkdirSync(project);
+  const expected = statSync(project);
+  const execute = vi.fn((_file, args, options) => {
+    expect(args).toEqual(['--no-canonicalize', '--bind', '/proc/self/fd/3', '/private/project']);
+    const actual = fstatSync(options.stdio[3]);
+    expect(actual.ino).toBe(expected.ino);
+    expect(actual.dev).toBe(expected.dev);
+  });
+  bindProjectDirectory(project, '/private/project', expected, { execFileSync: execute });
+  renameSync(project, join(directory, 'original'));
+  mkdirSync(project);
+  expect(() =>
+    bindProjectDirectory(project, '/private/project', expected, { execFileSync: execute }),
+  ).toThrow(/identity/);
+  rmSync(project, { recursive: true });
+  symlinkSync(join(directory, 'original'), project);
+  expect(() =>
+    bindProjectDirectory(project, '/private/project', expected, { execFileSync: execute }),
+  ).toThrow();
+  expect(execute).toHaveBeenCalledTimes(1);
 });

@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { statSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -281,4 +281,13 @@ it('keeps internal owner errors out of normal IPC failure messages', async () =>
   });
   expect(result.failure.message).not.toContain('private-session');
   expect(console.error).toHaveBeenCalledWith('Resource render failed:', error);
+});
+
+it('binds the task request to the owner-observed directory identity, ignoring IPC identity', async () => {
+  const { handle, request, taskRunner } = fixture();
+  const actual = statSync(request.projectDir);
+  await handle({ ...request, projectIdentity: { dev: -1, ino: -1 } });
+  expect(taskRunner.mock.calls[0]?.[1]).toMatchObject({
+    projectIdentity: { dev: actual.dev, ino: actual.ino },
+  });
 });

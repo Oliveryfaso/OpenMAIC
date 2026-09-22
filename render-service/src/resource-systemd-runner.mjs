@@ -6,6 +6,7 @@ import {
   constants,
   existsSync,
   fsyncSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -13,9 +14,10 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { processIdentity } from './resource-reference-scan.mjs';
@@ -389,6 +391,7 @@ function safeTaskConfig(settings, request, taskDir, stagePath) {
   return {
     id: request.id,
     projectDir: request.projectDir,
+    projectIdentity: request.projectIdentity,
     stagePath,
     privateRoot: join(taskDir, 'private'),
     resultPath: join(taskDir, 'result.json'),
@@ -416,13 +419,43 @@ function readTaskResult(path) {
   return JSON.parse(bytes.toString('utf8'));
 }
 
-export function publishStagedArtifact(stagePath, outputPath) {
-  const fd = openSync(dirname(outputPath), constants.O_RDONLY);
+function openProjectDirectory(directory, expectedIdentity) {
+  if (
+    !expectedIdentity ||
+    !Number.isSafeInteger(expectedIdentity.dev) ||
+    !Number.isSafeInteger(expectedIdentity.ino)
+  )
+    throw new Error('Missing trusted project directory identity');
+  const fd = openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    const opened = fstatSync(fd);
+    if (opened.dev !== expectedIdentity.dev || opened.ino !== expectedIdentity.ino)
+      throw new Error('Project directory identity changed');
+    return fd;
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+// The resource runtime is Linux-only. The portable branch supports local tests;
+// it does not qualify pathname-race handling on another operating system.
+function directoryEntry(fd, directory, name) {
+  return join(process.platform === 'linux' ? `/proc/self/fd/${fd}` : directory, name);
+}
+
+export function publishStagedArtifact(stagePath, outputPath, expectedIdentity) {
+  const directory = dirname(outputPath);
+  if (dirname(stagePath) !== directory) throw new Error('Publication paths must share a directory');
+  const fd = openProjectDirectory(directory, expectedIdentity);
   let publication;
   try {
     // Fail before the commit point if the target directory cannot be synced.
     fsyncSync(fd);
-    renameSync(stagePath, outputPath);
+    renameSync(
+      directoryEntry(fd, directory, basename(stagePath)),
+      directoryEntry(fd, directory, basename(outputPath)),
+    );
     try {
       fsyncSync(fd);
       publication = { directoryFsync: true };
@@ -456,12 +489,14 @@ export function publishStagedArtifact(stagePath, outputPath) {
   return publication;
 }
 
-function removeAndVerify(path, dependencies = {}) {
-  const remove = dependencies.remove ?? rmSync;
+function removeAndVerify(path, dependencies = {}, singleFile = false) {
+  const remove = singleFile ? (dependencies.unlink ?? unlinkSync) : (dependencies.remove ?? rmSync);
   const lstat = dependencies.lstat ?? lstatSync;
   let removalFailure;
   try {
-    remove(path, { recursive: true, force: true });
+    // Staging is worker-controlled: never traverse it, even if it is a directory.
+    if (singleFile) remove(path);
+    else remove(path, { recursive: true, force: true });
   } catch (error) {
     removalFailure = errorRecord(error);
   }
@@ -480,9 +515,38 @@ function removeAndVerify(path, dependencies = {}) {
   }
 }
 
-function settleUnpublished(stagePath, taskDir, status, failureCode, details, dependencies = {}) {
-  const stageCleanup = removeAndVerify(stagePath, dependencies);
-  const taskDirectoryCleanup = removeAndVerify(taskDir, dependencies);
+function removeStageAndVerify(stagePath, expectedIdentity, dependencies) {
+  let fd;
+  try {
+    const directory = dirname(stagePath);
+    fd = openProjectDirectory(directory, expectedIdentity);
+    return removeAndVerify(directoryEntry(fd, directory, basename(stagePath)), dependencies, true);
+  } catch (error) {
+    // Absence at a replacement pathname is not evidence about the original object.
+    return {
+      verified: false,
+      remains: 'unknown',
+      projectIdentityVerified: false,
+      observationFailure: errorRecord(error),
+    };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+export function settleUnpublished(
+  stagePath,
+  taskDir,
+  status,
+  failureCode,
+  details,
+  dependencies = {},
+) {
+  const stageCleanup = removeStageAndVerify(stagePath, details.projectIdentity, dependencies);
+  const taskDirectoryCleanup =
+    stageCleanup.projectIdentityVerified === false
+      ? { verified: false, remains: 'unknown', skipped: 'project_identity_unverified' }
+      : removeAndVerify(taskDir, dependencies);
   const cleanupVerified = stageCleanup.verified && taskDirectoryCleanup.verified;
   return {
     status,
@@ -517,12 +581,13 @@ export function taskSettlementDetails(task, readback, extra = {}) {
 export function finalizePublication(stagePath, outputPath, taskDir, details, dependencies = {}) {
   const publish = dependencies.publish ?? publishStagedArtifact;
   const cleanupDependencies = {
+    ...(dependencies.unlink ? { unlink: dependencies.unlink } : {}),
     ...(dependencies.remove ? { remove: dependencies.remove } : {}),
     ...(dependencies.lstat ? { lstat: dependencies.lstat } : {}),
   };
   let publication;
   try {
-    publication = publish(stagePath, outputPath);
+    publication = publish(stagePath, outputPath, details.projectIdentity);
   } catch (error) {
     return settleUnpublished(
       stagePath,
@@ -622,6 +687,7 @@ export async function runResourceTask(settings, request, signal, dependencies = 
   if (!Number.isSafeInteger(remainingMs) || remainingMs <= 0) {
     return settle(stagePath, taskDir, 'failed', 'deadline_exceeded', {
       notAdmitted: true,
+      projectIdentity: config.projectIdentity,
     });
   }
 
@@ -759,7 +825,7 @@ export async function runResourceTask(settings, request, signal, dependencies = 
         : deadlineExpired
           ? 'deadline_exceeded'
           : (taskResult.failureCode ?? 'execution_failed'),
-      taskSettlementDetails(taskResult, readback),
+      taskSettlementDetails(taskResult, readback, { projectIdentity: config.projectIdentity }),
     );
   }
 
@@ -769,13 +835,16 @@ export async function runResourceTask(settings, request, signal, dependencies = 
       taskDir,
       'cancelled',
       'cancelled',
-      taskSettlementDetails(taskResult, readback, { cancelledBeforePublish: true }),
+      taskSettlementDetails(taskResult, readback, {
+        cancelledBeforePublish: true,
+        projectIdentity: config.projectIdentity,
+      }),
     );
   }
   return publish(
     stagePath,
     request.outputPath,
     taskDir,
-    taskSettlementDetails(taskResult, readback),
+    taskSettlementDetails(taskResult, readback, { projectIdentity: config.projectIdentity }),
   );
 }

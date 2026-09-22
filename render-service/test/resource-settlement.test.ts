@@ -298,3 +298,41 @@ it('keeps default-executor TTL cleanup when no resource settlement exists', asyn
   expect(await store.get('legacy')).toBeNull();
   expect(reap).toHaveBeenCalledOnce();
 });
+
+it('contains a repeated settlement store failure without deleting a committed artifact', async () => {
+  const jobs = createMemoryJobStore();
+  const originalUpdate = jobs.update.bind(jobs);
+  const update = vi.spyOn(jobs, 'update').mockImplementation(async (id, patch) => {
+    if (patch.status === 'succeeded' || patch.status === 'failed')
+      throw new Error('store unavailable');
+    return originalUpdate(id, patch);
+  });
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const artifacts = createMemoryArtifactStore();
+  const resources: RenderResourceSettlement = {
+    published: true,
+    cleanupVerified: true,
+    reservationReturned: true,
+    admissionClosed: false,
+  };
+  const executor: RenderExecutor = {
+    async execute(request) {
+      await writeFile(request.outputPath, 'committed');
+      return { status: 'succeeded', resources };
+    },
+  };
+  const coordinator = new RenderCoordinator(executor, jobs, artifacts.store, { onEvent: () => {} });
+  const dir = await directory();
+  try {
+    const id = await coordinator.submit(coordinator.reserve('recovery-failure'), dir, options);
+    await vi.waitFor(() => expect(log).toHaveBeenCalled());
+    expect(update.mock.calls.filter(([, patch]) => patch.status === 'failed')).toHaveLength(1);
+    await expect(artifacts.store.locate(id)).resolves.toMatchObject({
+      path: join(dir, 'output.mp4'),
+    });
+    expect(await readFile(join(dir, 'output.mp4'), 'utf8')).toBe('committed');
+  } finally {
+    log.mockRestore();
+    update.mockRestore();
+  }
+});

@@ -3,6 +3,7 @@ import {
   closeSync,
   constants,
   fsyncSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -241,7 +242,14 @@ function validateConfig(config) {
   const project = realpathSync(config.projectDir);
   if (project !== config.projectDir || dirname(config.stagePath) !== project)
     throw new Error('Task paths escaped the project boundary');
-  if (!lstatSync(project).isDirectory() || lstatSync(project).uid !== config.workerUid)
+  const projectIdentity = lstatSync(project);
+  if (
+    !projectIdentity.isDirectory() ||
+    projectIdentity.uid !== config.workerUid ||
+    !config.projectIdentity ||
+    projectIdentity.dev !== config.projectIdentity.dev ||
+    projectIdentity.ino !== config.projectIdentity.ino
+  )
     throw new Error('Task project identity changed');
   for (const executable of [config.browserPath, config.ffmpegPath]) {
     if (!lstatSync(realpathSync(executable)).isFile())
@@ -263,6 +271,7 @@ function validateConfig(config) {
     )
   )
     throw new Error('Invalid Producer environment');
+  return projectIdentity;
 }
 
 /**
@@ -366,12 +375,35 @@ export async function closeoutTask(
   };
 }
 
+/** Bind the validated inode, even if the source pathname is replaced later. */
+export function bindProjectDirectory(project, target, expected, dependencies = {}) {
+  const execute = dependencies.execFileSync ?? execFileSync;
+  const fd = openSync(project, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    const opened = fstatSync(fd);
+    if (opened.dev !== expected.dev || opened.ino !== expected.ino)
+      throw new Error('Task project identity changed before bind');
+    execute('/usr/bin/mount', ['--no-canonicalize', '--bind', '/proc/self/fd/3', target], {
+      stdio: ['ignore', 'inherit', 'inherit', fd],
+      timeout: 20_000,
+    });
+  } finally {
+    closeSync(fd);
+  }
+}
+
 async function main() {
   if (process.platform !== 'linux' || process.getuid() !== 0)
     throw new Error('Resource task runner requires Linux root');
   const configPath = resolve(process.argv[2] ?? '');
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
-  validateConfig(config);
+  const result = await runTask(config);
+  process.exitCode = result.status === 'succeeded' ? 0 : 1;
+}
+
+/** Production task lifecycle; OS boundaries can be mocked without replacing its cancellation wiring. */
+export async function runTask(config) {
+  const projectIdentity = validateConfig(config);
   const privateRoot = config.privateRoot;
   const privateProject = join(privateRoot, 'project');
   const candidate = join(privateRoot, 'out', 'candidate.mp4');
@@ -412,7 +444,7 @@ async function main() {
     ]);
     privateMounted = true;
     for (const path of ['tmp', 'home', 'out', 'project']) mkdirSync(join(privateRoot, path));
-    command('/usr/bin/mount', ['--bind', config.projectDir, privateProject]);
+    bindProjectDirectory(config.projectDir, privateProject, projectIdentity);
     projectMounted = true;
     command('/usr/bin/mount', ['-o', 'remount,bind,ro,nosuid,nodev', privateProject]);
     for (const path of ['tmp', 'home', 'out'])
@@ -523,8 +555,11 @@ async function main() {
   details.resourceAccounting = resourceAccounting;
   if (resourceAccounting.status === 'CAPTURED') details.residual = resourceAccounting.measurements;
   else details.accountingFailure = resourceAccounting.errors;
-  writeResult(config.resultPath, { status, failureCode, cleanupVerified, details });
-  process.exitCode = status === 'succeeded' ? 0 : 1;
+  process.removeListener('SIGTERM', stop);
+  process.removeListener('SIGINT', stop);
+  const result = { status, failureCode, cleanupVerified, details };
+  writeResult(config.resultPath, result);
+  return result;
 }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url)

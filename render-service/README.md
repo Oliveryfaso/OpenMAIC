@@ -366,6 +366,11 @@ the settlement unreturned and closes admission. While running, the owner also
 samples the shared systemd slice and its memory ancestors: a local `high`, `max`
 or `oom` event, an active `memory.high`, or unreadable/reset evidence closes
 admission until an operator audits and restarts the owner.
+A unit launch failure also retains the task directory and closes admission,
+even when no worker is known to have started. This conservative path does not
+infer safe cleanup from a failed launch command. An operator must audit the
+unit, cgroup, mounts and task state before cleanup and owner restart; there is
+no automatic retry or admission reset.
 
 Fixed-input Linux evidence on Ubuntu 22.04 x86_64 with Node 22.23.2, systemd
 249 and cgroup v2 covers consecutive renders under one owner, cancellation and

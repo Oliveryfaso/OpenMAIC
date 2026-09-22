@@ -432,13 +432,20 @@ export class RenderCoordinator {
           message: error instanceof Error ? error.message : String(error),
         };
         this.finishEvent(id, 'failed', failure.code);
-        await this.jobs.update(id, {
-          status: 'failed',
-          currentStage: 'failed',
-          failure,
-          error: failure.message,
-          resources,
-        });
+        await this.jobs
+          .update(id, {
+            status: 'failed',
+            currentStage: 'failed',
+            failure,
+            error: failure.message,
+            resources,
+          })
+          .catch((recoveryError: unknown) => {
+            console.error('Failed to record committed render settlement', {
+              jobId: id,
+              error: recoveryError,
+            });
+          });
         return;
       }
       await this.artifacts.remove(id).catch(() => {});
