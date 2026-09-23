@@ -13,7 +13,7 @@ import {
 import { Pool } from 'pg';
 
 import { validateAppScene, validateAppStage } from '@/lib/document-store/validators';
-import { lazyAssetByteStore } from '@/lib/persistence/asset-byte-store';
+import { configuredLazyAssetByteStore } from '@/lib/persistence/asset-byte-store';
 import { resolveAssetPendingTtlMs } from '@/lib/persistence/asset-pending-ttl';
 import { resolveAssetQuotaBytes } from '@/lib/persistence/asset-quota';
 import { ensureOwnerMaterialSchema } from '@/lib/persistence/owner-materials';
@@ -22,10 +22,16 @@ import { APP_RUNTIME_PAYLOAD_VALIDATORS } from '@/lib/runtime/payload-validators
 
 export type PersistencePoolFactory = (connectionString: string) => Pool;
 
+/**
+ * The process's persistence stores. There is deliberately no document store
+ * here: an unscoped `PgDocumentStore` would write courses with no owner check
+ * and no host create hooks. Documents are reached only through the
+ * owner-bound store (`createOwnerBoundDocumentStore`,
+ * `getOwnerScopedDocumentStore`).
+ */
 export interface ServerPersistenceProvider {
   pool: Pool;
   runtimeStore: PgRuntimeStore;
-  documentStore: PgDocumentStore;
   assetStore: PgAssetStore;
   /** Pin a body to one fresh transaction on the pool. */
   withTransaction: WithTransaction;
@@ -68,7 +74,7 @@ async function createServerPersistenceProvider(
     await ensureOwnerMaterialSchema(queryable);
     await ensureAssetSchema(queryable);
     const withTransaction = nodePostgresTransaction(queryable);
-    const byteStore = lazyAssetByteStore(process.env.ASSET_S3_BUCKET, queryable);
+    const byteStore = configuredLazyAssetByteStore(queryable);
     const documentStore = new PgDocumentStore(queryable, {
       withTransaction,
       validateScene: validateAppScene,
@@ -111,7 +117,6 @@ async function createServerPersistenceProvider(
         withTransaction,
         payloadValidators: APP_RUNTIME_PAYLOAD_VALIDATORS,
       }),
-      documentStore,
       assetStore: assetRegistry(queryable, withTransaction),
       withTransaction,
       assetStoreIn: (pinned) => assetRegistry(pinned, (body) => body(pinned)),
