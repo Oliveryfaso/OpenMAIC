@@ -92,6 +92,55 @@ describe('Legacy structured parser: provider tool-call markup', () => {
     expect(state.providerMarkupSuppressed).toBe(false);
   });
 
+  it('does not end the array early when a held "<" follows a "]" inside a string', () => {
+    const speech = '代码 arr[i]<limit 表示比较数组元素与上限。';
+    const output = JSON.stringify([
+      { type: 'text', content: speech },
+      { type: 'action', name: 'wb_open', params: {} },
+    ]);
+    const splitAt = output.indexOf('<') + 1;
+    const whole = parseChunks([output]);
+    const split = parseChunks([output.slice(0, splitAt), output.slice(splitAt)]);
+
+    expect(split.text).toBe(speech);
+    expect(split.text).toBe(whole.text);
+    expect(split.actions.map((action) => action.actionName)).toEqual(['wb_open']);
+    expect(whole.actions.map((action) => action.actionName)).toEqual(['wb_open']);
+  });
+
+  it('holds a whitespace-padded prefix of any length until the markup is decided', () => {
+    const { state, text, actions } = parseChunks([
+      `<${' '.repeat(32)}`,
+      '｜DSML｜parameter name="params">[{"type":"action","name":"wb_open","params":{}}]',
+      '</｜DSML｜parameter>',
+    ]);
+
+    expect(text).toBe('');
+    expect(actions).toEqual([]);
+    expect(state.providerMarkupSuppressed).toBe(true);
+  });
+
+  it.each([
+    ['markup only', DSML_WB_CLEAR],
+    ['prose then markup', `好的，我们换一道新题。\n${DSML_WB_CLEAR}`],
+    [
+      'padded marker with JSON parameters',
+      `先看题目。<${' '.repeat(40)}｜DSML｜parameter name="params">[{"type":"action","name":"wb_open","params":{}}]</｜DSML｜parameter>`,
+    ],
+  ])('gives the same result for every two-chunk split: %s', (_label, output) => {
+    const whole = parseChunks([output]);
+    expect(whole.actions).toEqual([]);
+
+    for (let splitAt = 1; splitAt < output.length; splitAt++) {
+      const split = parseChunks([output.slice(0, splitAt), output.slice(splitAt)]);
+      expect({ splitAt, text: split.text, actions: split.actions }).toEqual({
+        splitAt,
+        text: whole.text,
+        actions: [],
+      });
+    }
+  });
+
   it.each([
     'DSML 是一种工具调用标记格式，我们今天不讨论它。',
     '写作 <DSML> 的标签不是厂商标记。',

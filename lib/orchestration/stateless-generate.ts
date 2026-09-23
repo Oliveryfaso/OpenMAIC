@@ -79,8 +79,9 @@ export function createParserState(): ParserState {
  * prose that merely mentions "DSML" stays visible.
  */
 const PROVIDER_TOOL_MARKUP = /<\s*\/?\s*[｜|]+\s*DSML\s*[｜|]+/;
+// Every proper prefix of PROVIDER_TOOL_MARKUP, with the same unbounded
+// whitespace, so a split stream is judged exactly like the whole text.
 const PROVIDER_TOOL_MARKUP_PREFIX = /^<\s*\/?\s*(?:[｜|]+\s*(?:D(?:S(?:M(?:L\s*)?)?)?)?)?$/;
-const PROVIDER_TOOL_MARKUP_PREFIX_MAX = 32;
 
 /** Return the text before the first provider tool-call markup token. */
 export function stripProviderToolMarkup(text: string): string {
@@ -104,11 +105,7 @@ function gateProviderToolMarkup(chunk: string, state: ParserState): string {
     return kept;
   }
   const prefixStart = text.lastIndexOf('<');
-  if (
-    prefixStart !== -1 &&
-    text.length - prefixStart <= PROVIDER_TOOL_MARKUP_PREFIX_MAX &&
-    PROVIDER_TOOL_MARKUP_PREFIX.test(text.slice(prefixStart))
-  ) {
+  if (prefixStart !== -1 && PROVIDER_TOOL_MARKUP_PREFIX.test(text.slice(prefixStart))) {
     state.pendingMarkupPrefix = text.slice(prefixStart);
     return text.slice(0, prefixStart);
   }
@@ -196,6 +193,12 @@ export function parseStructuredChunk(chunk: string, state: ParserState): ParseRe
   }
 
   state.buffer += gateProviderToolMarkup(chunk, state);
+  // A held prefix is undecided output. Parsing the buffer without it would cut
+  // the stream at an arbitrary point (e.g. right after a `]` inside a string);
+  // wait for the next chunk or finalizeParser instead.
+  if (state.pendingMarkupPrefix) {
+    return result;
+  }
 
   // Step 1: Find the opening `[` if not yet found
   if (!state.jsonStarted) {

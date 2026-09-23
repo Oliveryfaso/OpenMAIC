@@ -720,6 +720,44 @@ describe('Pi call_agent JSON action output', () => {
       expect(third.details).toMatchObject({ skipped: true, reason: 'consecutive_empty_turns' });
     });
 
+    it('keeps the full speech and later action when a chunk ends at "<" after a "]"', async () => {
+      const speech = '代码 arr[i]<limit 表示比较数组元素与上限。';
+      const output = JSON.stringify([
+        { type: 'text', content: speech },
+        { type: 'action', name: 'wb_open', params: {} },
+      ]);
+      const splitAt = output.indexOf('<') + 1;
+      mockChildWithChunks([output.slice(0, splitAt), output.slice(splitAt)]);
+      const { buildCallAgentTool } = await import('@/lib/chat/pi/tools/call-agent');
+      const events: StatelessEvent[] = [];
+      const tool = buildCallAgentTool(baseToolOpts(events));
+
+      const result = await tool.execute('call-1', { agentId: teacher.id, instruction: 'go' });
+
+      expect(visibleSpeech(events)).toBe(speech);
+      expect(
+        events.filter((event) => event.type === 'action').map((event) => event.data.actionName),
+      ).toEqual(['wb_open']);
+      expect(result.details).toMatchObject({ text: speech, actionWarnings: [] });
+    });
+
+    it('executes no action from a chunked, whitespace-padded markup parameter', async () => {
+      mockChildWithChunks([
+        `<${' '.repeat(32)}`,
+        '｜DSML｜parameter name="params">[{"type":"action","name":"wb_open","params":{}}]',
+        '</｜DSML｜parameter>',
+      ]);
+      const { buildCallAgentTool } = await import('@/lib/chat/pi/tools/call-agent');
+      const events: StatelessEvent[] = [];
+      const tool = buildCallAgentTool(baseToolOpts(events));
+
+      const result = await tool.execute('call-1', { agentId: teacher.id, instruction: 'go' });
+
+      expect(visibleSpeech(events)).toBe('');
+      expect(events.filter((event) => event.type === 'action')).toEqual([]);
+      expect(result.details).toMatchObject({ text: '', actionWarnings: [markupWarning] });
+    });
+
     it('keeps structured JSON actions and speech that mentions DSML', async () => {
       const speech = 'DSML 是一种工具调用标记格式，这里只作说明。';
       mockChildWithJsonOutput(
