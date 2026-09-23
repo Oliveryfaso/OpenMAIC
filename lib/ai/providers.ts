@@ -22,6 +22,8 @@
  * - https://siliconflow.cn/models
  * - https://siliconflow.cn/pricing
  * - https://www.volcengine.com/docs/82379/1330310
+ * - https://platform.xiaomimimo.com/static/docs/pricing.md
+ * - https://platform.xiaomimimo.com/static/docs/tokenplan/quick-access.md
  * - https://mimo.mi.com/static/docs/quick-start/summary/model.md
  * - https://mimo.mi.com/static/docs/api/chat/openai-api.md
  */
