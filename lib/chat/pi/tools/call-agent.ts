@@ -10,6 +10,7 @@ import {
   finalizeParser,
   looksLikeStructuredFragment,
   parseStructuredChunk,
+  stripProviderToolMarkup,
   type ParseResult,
 } from '@/lib/orchestration/stateless-generate';
 import type { AgentConfig } from '@/lib/orchestration/registry/types';
@@ -950,9 +951,20 @@ export function buildCallAgentTool(opts: {
       });
 
       const emittedText = text.trim();
-      const fallbackText = sawStructuredOutput
+      const rawFallbackText = sawStructuredOutput
         ? ''
-        : sanitizeVisibleSpeech(extractLastAssistantText(child.state.messages)).trim();
+        : extractLastAssistantText(child.state.messages);
+      const markupFreeFallbackText = stripProviderToolMarkup(rawFallbackText);
+      if (
+        parserState.providerMarkupSuppressed ||
+        markupFreeFallbackText.length < rawFallbackText.length
+      ) {
+        warn({
+          reason: 'raw_structured_fallback',
+          message: 'Suppressed provider tool-call markup; no action was executed from it.',
+        });
+      }
+      const fallbackText = sanitizeVisibleSpeech(markupFreeFallbackText).trim();
       // Bug 2 guard: only count a turn as real teaching when it produced genuine
       // visible speech. Two distinct sources need different trust levels:
       //   - `emittedText`: already streamed through processParseResult, where every

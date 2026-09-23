@@ -50,6 +50,10 @@ interface ParserState {
   lastPartialTextLength: number;
   /** Whether parsing is complete (closing `]` found) */
   isDone: boolean;
+  /** Chunk tail held back because it may be the start of provider tool-call markup */
+  pendingMarkupPrefix: string;
+  /** Whether provider tool-call markup was cut from the stream */
+  providerMarkupSuppressed: boolean;
 }
 
 /**
@@ -62,7 +66,53 @@ export function createParserState(): ParserState {
     lastParsedItemCount: 0,
     lastPartialTextLength: 0,
     isDone: false,
+    pendingMarkupPrefix: '',
+    providerMarkupSuppressed: false,
   };
+}
+
+/**
+ * Provider tool-call markup (DeepSeek DSML, e.g. `<｜DSML｜invoke name="...">`)
+ * is not part of the structured-output contract. It can arrive as plain text
+ * when the request registers no native tools, and must never become visible
+ * speech or an executable action. Only the bar-delimited token matches, so
+ * prose that merely mentions "DSML" stays visible.
+ */
+const PROVIDER_TOOL_MARKUP = /<\s*\/?\s*[｜|]+\s*DSML\s*[｜|]+/;
+const PROVIDER_TOOL_MARKUP_PREFIX = /^<\s*\/?\s*(?:[｜|]+\s*(?:D(?:S(?:M(?:L\s*)?)?)?)?)?$/;
+const PROVIDER_TOOL_MARKUP_PREFIX_MAX = 32;
+
+/** Return the text before the first provider tool-call markup token. */
+export function stripProviderToolMarkup(text: string): string {
+  const markupIndex = text.search(PROVIDER_TOOL_MARKUP);
+  return markupIndex === -1 ? text : text.slice(0, markupIndex);
+}
+
+/**
+ * Cut the stream at the first provider tool-call markup token. A chunk tail
+ * that could still become that token is held until the next chunk (or
+ * finalizeParser) decides it.
+ */
+function gateProviderToolMarkup(chunk: string, state: ParserState): string {
+  if (state.providerMarkupSuppressed) return '';
+  const text = state.pendingMarkupPrefix + chunk;
+  state.pendingMarkupPrefix = '';
+  const kept = stripProviderToolMarkup(text);
+  if (kept.length < text.length) {
+    state.providerMarkupSuppressed = true;
+    log.warn('[parser] Suppressed provider tool-call markup; no action was taken from it');
+    return kept;
+  }
+  const prefixStart = text.lastIndexOf('<');
+  if (
+    prefixStart !== -1 &&
+    text.length - prefixStart <= PROVIDER_TOOL_MARKUP_PREFIX_MAX &&
+    PROVIDER_TOOL_MARKUP_PREFIX.test(text.slice(prefixStart))
+  ) {
+    state.pendingMarkupPrefix = text.slice(prefixStart);
+    return text.slice(0, prefixStart);
+  }
+  return text;
 }
 
 /**
@@ -145,7 +195,7 @@ export function parseStructuredChunk(chunk: string, state: ParserState): ParseRe
     return result;
   }
 
-  state.buffer += chunk;
+  state.buffer += gateProviderToolMarkup(chunk, state);
 
   // Step 1: Find the opening `[` if not yet found
   if (!state.jsonStarted) {
@@ -335,6 +385,10 @@ export function finalizeParser(state: ParserState): ParseResult {
   if (state.isDone) {
     return result;
   }
+
+  // The stream ended, so a held tail can no longer become provider markup.
+  state.buffer += state.pendingMarkupPrefix;
+  state.pendingMarkupPrefix = '';
 
   const content = state.buffer.trim();
   if (!content) {

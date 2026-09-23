@@ -625,6 +625,123 @@ describe('Pi call_agent JSON action output', () => {
     );
   });
 
+  describe('provider tool-call markup (DSML) in Legacy child text', () => {
+    const dsmlWbClear = [
+      '<｜｜DSML｜｜ calls>',
+      '<｜｜DSML｜｜ invoke name="action">',
+      '<｜｜DSML｜｜ parameter name="name" string="true">wb_clear</｜｜DSML｜｜ parameter>',
+      '<｜｜DSML｜｜ parameter name="params" string="false">{}</｜｜DSML｜｜ parameter>',
+      '</｜｜DSML｜｜ invoke>',
+      '</｜｜DSML｜｜ calls>',
+    ].join('\n');
+    const markupWarning = expect.objectContaining({ reason: 'raw_structured_fallback' });
+
+    function visibleSpeech(events: StatelessEvent[]): string {
+      return events
+        .filter((event) => event.type === 'text_delta')
+        .map((event) => event.data.content)
+        .join('');
+    }
+
+    it('does not present markup-only output as an answer or execute it', async () => {
+      mockChildWithJsonOutput(dsmlWbClear);
+      const onAgentDone = vi.fn();
+      const { buildCallAgentTool } = await import('@/lib/chat/pi/tools/call-agent');
+      const events: StatelessEvent[] = [];
+      const tool = buildCallAgentTool({ ...baseToolOpts(events), onAgentDone });
+
+      const result = await tool.execute('call-1', { agentId: teacher.id, instruction: 'go' });
+
+      expect(visibleSpeech(events)).toBe('');
+      expect(events.filter((event) => event.type === 'action')).toEqual([]);
+      expect(result.content).toEqual([
+        { type: 'text', text: `${teacher.name}: (no visible response)` },
+      ]);
+      expect(result.details).toMatchObject({ text: '', actionWarnings: [markupWarning] });
+      expect(onAgentDone).toHaveBeenLastCalledWith(
+        expect.objectContaining({ contentPreview: '', actionCount: 0 }),
+      );
+    });
+
+    it('streams the prose before chunked markup and nothing after it', async () => {
+      const prose = '好的，我们换一道新题。';
+      mockChildWithChunks([`${prose}\n<`, '｜｜DSML｜｜ calls>\n', dsmlWbClear.slice(18)]);
+      const { buildCallAgentTool } = await import('@/lib/chat/pi/tools/call-agent');
+      const events: StatelessEvent[] = [];
+      const tool = buildCallAgentTool(baseToolOpts(events));
+
+      const result = await tool.execute('call-1', { agentId: teacher.id, instruction: 'go' });
+
+      expect(visibleSpeech(events)).toBe(prose);
+      expect(events.filter((event) => event.type === 'action')).toEqual([]);
+      expect(result.details).toMatchObject({ text: prose, actionWarnings: [markupWarning] });
+    });
+
+    it.each([
+      ['markup only', dsmlWbClear, ''],
+      ['prose then markup', `先看这一步。\n${dsmlWbClear}`, '先看这一步。'],
+    ])('filters the raw last-message fallback: %s', async (_label, finalMessage, expectedText) => {
+      // No deltas reach the parser, so only the raw-message fallback sees the text.
+      mocks.buildAgent.mockReturnValue({
+        subscribe: () => () => {},
+        prompt: async () => {},
+        waitForIdle: async () => {},
+        state: {
+          messages: [{ role: 'assistant', content: [{ type: 'text', text: finalMessage }] }],
+        },
+      });
+      const { buildCallAgentTool } = await import('@/lib/chat/pi/tools/call-agent');
+      const events: StatelessEvent[] = [];
+      const tool = buildCallAgentTool(baseToolOpts(events));
+
+      const result = await tool.execute('call-1', { agentId: teacher.id, instruction: 'go' });
+
+      expect(visibleSpeech(events)).toBe(expectedText);
+      expect(result.details).toMatchObject({
+        text: expectedText,
+        actionWarnings: [markupWarning],
+      });
+    });
+
+    it('counts repeated markup-only turns toward the existing empty-turn guard', async () => {
+      const { buildCallAgentTool } = await import('@/lib/chat/pi/tools/call-agent');
+      const events: StatelessEvent[] = [];
+      const tool = buildCallAgentTool(baseToolOpts(events));
+
+      for (const callId of ['c1', 'c2']) {
+        mocks.buildAgent.mockReset();
+        mockChildWithJsonOutput(dsmlWbClear);
+        await tool.execute(callId, { agentId: teacher.id, instruction: 'go' });
+      }
+      mocks.buildAgent.mockReset();
+      mockChildWithJsonOutput(dsmlWbClear);
+      const third = await tool.execute('c3', { agentId: teacher.id, instruction: 'go' });
+
+      expect(third.details).toMatchObject({ skipped: true, reason: 'consecutive_empty_turns' });
+    });
+
+    it('keeps structured JSON actions and speech that mentions DSML', async () => {
+      const speech = 'DSML 是一种工具调用标记格式，这里只作说明。';
+      mockChildWithJsonOutput(
+        JSON.stringify([
+          { type: 'action', name: 'wb_open', params: {} },
+          { type: 'text', content: speech },
+        ]),
+      );
+      const { buildCallAgentTool } = await import('@/lib/chat/pi/tools/call-agent');
+      const events: StatelessEvent[] = [];
+      const tool = buildCallAgentTool(baseToolOpts(events));
+
+      const result = await tool.execute('call-1', { agentId: teacher.id, instruction: 'go' });
+
+      expect(visibleSpeech(events)).toBe(speech);
+      expect(
+        events.filter((event) => event.type === 'action').map((event) => event.data.actionName),
+      ).toEqual(['wb_open']);
+      expect(result.details).toMatchObject({ text: speech, actionWarnings: [] });
+    });
+  });
+
   it('accepts play_video for a current-slide video element', async () => {
     mockChildWithJsonOutput(
       JSON.stringify([
