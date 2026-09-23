@@ -121,6 +121,40 @@ describe('Legacy structured parser: provider tool-call markup', () => {
   });
 
   it.each([
+    [
+      'complete array followed by an undecided marker',
+      '[{"type":"text","content":"先打开白板。"},{"type":"action","name":"wb_open","params":{}}]<',
+      '先打开白板。',
+    ],
+    [
+      'complete action followed by truncated comparison text',
+      '[{"type":"action","name":"wb_open","params":{}},{"type":"text","content":"比较 a <',
+      '比较 a <',
+    ],
+  ])('recovers %s at EOF regardless of chunk boundaries', (_label, output, expectedText) => {
+    const chunkings = [[output], [...output]];
+    for (let splitAt = 1; splitAt < output.length; splitAt++) {
+      chunkings.push([output.slice(0, splitAt), output.slice(splitAt)]);
+    }
+    for (const chunks of chunkings) {
+      const { state, text, actions } = parseChunks(chunks);
+      expect(text).toBe(expectedText);
+      expect(actions.map((action) => action.actionName)).toEqual(['wb_open']);
+      expect(state.providerMarkupSuppressed).toBe(false);
+      // Finalizing again must not replay recovered speech or actions.
+      expect(finalizeParser(state)).toMatchObject({ textChunks: [], actions: [] });
+    }
+  });
+
+  it('does not execute an incomplete action when its held prefix reaches EOF', () => {
+    const { actions } = parseChunks([
+      '[{"type":"action","name":"wb_draw_text","params":{"content":"a <',
+    ]);
+
+    expect(actions).toEqual([]);
+  });
+
+  it.each([
     ['markup only', DSML_WB_CLEAR],
     ['prose then markup', `好的，我们换一道新题。\n${DSML_WB_CLEAR}`],
     [

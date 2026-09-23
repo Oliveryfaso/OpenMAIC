@@ -193,12 +193,6 @@ export function parseStructuredChunk(chunk: string, state: ParserState): ParseRe
   }
 
   state.buffer += gateProviderToolMarkup(chunk, state);
-  // A held prefix is undecided output. Parsing the buffer without it would cut
-  // the stream at an arbitrary point (e.g. right after a `]` inside a string);
-  // wait for the next chunk or finalizeParser instead.
-  if (state.pendingMarkupPrefix) {
-    return result;
-  }
 
   // Step 1: Find the opening `[` if not yet found
   if (!state.jsonStarted) {
@@ -209,6 +203,13 @@ export function parseStructuredChunk(chunk: string, state: ParserState): ParseRe
     // Trim everything before `[` (markdown fences, explanatory text, etc.)
     state.buffer = state.buffer.slice(bracketIndex);
     state.jsonStarted = true;
+  }
+
+  // Record the array start before waiting, so EOF can recover buffered items.
+  // A held prefix is undecided output. Parsing the buffer without it would cut
+  // the stream at an arbitrary point (e.g. right after a `]` inside a string).
+  if (state.pendingMarkupPrefix) {
+    return result;
   }
 
   // Step 2: Check if the array is complete (closing `]` found)
@@ -389,8 +390,19 @@ export function finalizeParser(state: ParserState): ParseResult {
     return result;
   }
 
-  // The stream ended, so a held tail can no longer become provider markup.
-  state.buffer += state.pendingMarkupPrefix;
+  // At EOF, restore a held tail inside unfinished content. If the buffered
+  // array is already complete, the tail is outside that response and must not
+  // prevent its final item from being emitted. Use a strict parse here: a `]`
+  // inside a string must never be mistaken for a complete array.
+  let completeArrayBeforeTail = false;
+  if (state.pendingMarkupPrefix && state.jsonStarted) {
+    try {
+      completeArrayBeforeTail = Array.isArray(JSON.parse(state.buffer));
+    } catch {
+      // Incomplete JSON still needs the held text before recovery below.
+    }
+  }
+  if (!completeArrayBeforeTail) state.buffer += state.pendingMarkupPrefix;
   state.pendingMarkupPrefix = '';
 
   const content = state.buffer.trim();

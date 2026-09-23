@@ -758,6 +758,36 @@ describe('Pi call_agent JSON action output', () => {
       expect(result.details).toMatchObject({ text: '', actionWarnings: [markupWarning] });
     });
 
+    it.each([
+      [
+        'complete array followed by an undecided marker',
+        '[{"type":"text","content":"先打开白板。"},{"type":"action","name":"wb_open","params":{}}]<',
+        '先打开白板。',
+      ],
+      [
+        'complete action followed by truncated comparison text',
+        '[{"type":"action","name":"wb_open","params":{}},{"type":"text","content":"比较 a <',
+        '比较 a <',
+      ],
+    ])('recovers %s when the first chunk ends the stream', async (_label, output, speech) => {
+      mockChildWithChunks([output]);
+      const { buildCallAgentTool } = await import('@/lib/chat/pi/tools/call-agent');
+      const events: StatelessEvent[] = [];
+      const onAgentDone = vi.fn();
+      const tool = buildCallAgentTool({ ...baseToolOpts(events), onAgentDone });
+
+      const result = await tool.execute('call-1', { agentId: teacher.id, instruction: 'go' });
+
+      expect(visibleSpeech(events)).toBe(speech);
+      expect(
+        events.filter((event) => event.type === 'action').map((event) => event.data.actionName),
+      ).toEqual(['wb_open']);
+      expect(result.details).toMatchObject({ text: speech, actionWarnings: [] });
+      expect(onAgentDone).toHaveBeenCalledWith(
+        expect.objectContaining({ contentPreview: speech, actionCount: 1 }),
+      );
+    });
+
     it('keeps structured JSON actions and speech that mentions DSML', async () => {
       const speech = 'DSML 是一种工具调用标记格式，这里只作说明。';
       mockChildWithJsonOutput(
