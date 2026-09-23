@@ -38,6 +38,7 @@ import { Pool } from 'pg';
 
 import { resolveAssetCollectionGraceMs } from '@/lib/persistence/asset-collection-grace';
 import { configuredS3Bucket, createAssetByteStore } from '@/lib/persistence/asset-byte-store';
+import { assetReferencePrincipalsForOwner } from '@/lib/persistence/owner-assets';
 import { getServerPersistenceProvider } from '@/lib/persistence/server-provider';
 
 /**
@@ -109,9 +110,7 @@ export function startAssetCollectorSchedule(
 
   // No database, no collector. DATABASE_URL is what makes server persistence
   // real; without it every asset lives in the browser and nothing here has
-  // anything to reclaim. PERSISTENCE_DEV_TOKEN deliberately does not gate this:
-  // it authenticates the HTTP surface, and bytes already written still have to
-  // be reclaimed if it is later removed.
+  // anything to reclaim.
   const connectionString = process.env.DATABASE_URL?.trim();
   if (!connectionString) return undefined;
   if (!collectionEnabled()) return undefined;
@@ -181,6 +180,9 @@ export function startAssetCollectorSchedule(
       // comments in lib/persistence/server-provider.ts and
       // lib/persistence/owner-bound-document-store.ts.
       documentReferences: true,
+      // The backfill scopes each document's references exactly as a write by
+      // that document's owner would (lib/persistence/owner-bound-document-store.ts).
+      assetReferencePrincipals: assetReferencePrincipalsForOwner,
     });
   };
   const collector = (): Promise<AssetCollector> =>
