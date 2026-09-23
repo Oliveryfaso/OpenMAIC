@@ -40,6 +40,8 @@ export type DirectorSceneEvidenceMetadata = Pick<
 >;
 
 const MAX_SCENE_EVIDENCE_CHARS = 24_000;
+const INTERACTIVE_NO_STATIC_TEXT_BOUNDARY =
+  '\nContent boundary: no Interactive source static text is available; only outline and scene metadata are available.';
 
 function serializeStaticSourceText(text: string): string {
   // Preserve authored text as a JSON string, without letting decoded HTML
@@ -114,7 +116,7 @@ function buildSceneEvidence(body: StatelessChatRequest, sceneId: string): string
     scene.type === 'interactive'
       ? staticSourceEvidence
         ? '\nContent boundary: raw interactive HTML is not exposed by read_scene; only outline/scene metadata and the separately labeled static-source result above are available.'
-        : '\nContent boundary: no Interactive source static text is available; only outline and scene metadata are available.'
+        : INTERACTIVE_NO_STATIC_TEXT_BOUNDARY
       : scene.type === 'pbl'
         ? '\nContent boundary: pbl payload is not exposed by read_scene v1; only its visible outline and scene metadata are available.'
         : '';
@@ -125,7 +127,7 @@ function buildSceneEvidence(body: StatelessChatRequest, sceneId: string): string
     // Drop the whole static block rather than losing otherwise usable outline
     // evidence or silently keeping only part of the authored instructions.
     // execute still checks the fallback, including this availability note.
-    return `${baseEvidence}\nCourseware source static information (课件源码中的静态说明): unavailable because the static text exceeds the scene evidence budget.${featureBoundary}`;
+    return `${baseEvidence}\nCourseware source static information (课件源码中的静态说明): unavailable because the static text exceeds the scene evidence budget.${INTERACTIVE_NO_STATIC_TEXT_BOUNDARY}`;
   }
   return evidence;
 }

@@ -729,6 +729,12 @@ describe('POST /api/chat/pi cue_user', () => {
         expect(captured.childPrompts[0]).toContain(
           'unavailable because the static text exceeds the scene evidence budget',
         );
+        expect(captured.childPrompts[0]).toContain(
+          'Content boundary: no Interactive source static text is available; only outline and scene metadata are available.',
+        );
+        expect(captured.childPrompts[0]).not.toContain(
+          'the separately labeled static-source result above',
+        );
         expect(captured.callAgentResults[0]?.details).toHaveProperty('sceneEvidence');
       }
       expect(captured.callAgentResults[1]?.details).not.toHaveProperty('sceneEvidence');
