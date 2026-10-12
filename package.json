@@ -1,6 +1,6 @@
 {
   "name": "openmaic",
-  "version": "1.2.0-rc.1",
+  "version": "1.2.0-rc.2",
   "private": true,
   "license": "MIT",
   "engines": {
@@ -104,6 +104,7 @@
     "file-saver": "^2.0.5",
     "geist": "^1.7.0",
     "graphemer": "1.4.0",
+    "htmlparser2": "^8.0.2",
     "i18next": "^26.0.1",
     "i18next-resources-to-backend": "^1.2.1",
     "immer": "^11.1.3",

@@ -1,6 +1,11 @@
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import type { Browser } from 'puppeteer-core';
 import { PreviewGate } from '../src/preview-gate.js';
-import { PreviewTimeoutError, type PreviewRenderer } from '../src/preview-renderer.js';
+import {
+  ChromiumPreviewRenderer,
+  PreviewTimeoutError,
+  type PreviewRenderer,
+} from '../src/preview-renderer.js';
 import {
   MAX_INTERACTIVE_HTML_DEPTH,
   MAX_INTERACTIVE_HTML_ELEMENTS,
@@ -13,6 +18,7 @@ import {
   createMemoryJobStore,
   succeedingExecutor,
 } from './support/fakes.js';
+import { submitRender } from './support/identities.js';
 
 process.env.RENDER_SERVICE_NO_LISTEN = 'true';
 
@@ -23,6 +29,8 @@ beforeAll(async () => {
   ({ createApp } = await import('../src/main.js'));
   ({ RenderCoordinator } = await import('../src/render-coordinator.js'));
 });
+
+afterEach(() => vi.unstubAllEnvs());
 
 function previewPayload() {
   return {
@@ -108,6 +116,61 @@ function appWith(
 }
 
 describe('POST /preview', () => {
+  it.each(['disconnect', 'deadline'])(
+    'holds execution capacity through a %s during Chromium launch and its cleanup',
+    async (reason) => {
+      vi.stubEnv('PRODUCER_HEADLESS_SHELL_PATH', '/test/chromium');
+      const launching = deferred<Browser>();
+      const closing = deferred();
+      const kill = vi.fn();
+      const close = vi.fn(() => closing.promise);
+      const browser = { close, process: () => ({ kill }) } as unknown as Browser;
+      const launch = vi
+        .fn<() => Promise<Browser>>()
+        .mockImplementationOnce(() => launching.promise)
+        .mockRejectedValue(new Error('unexpected parallel Chromium launch'));
+      const renderer = new ChromiumPreviewRenderer({ browserLauncher: { launch } });
+      const app = appWith(renderer, new PreviewGate(8, 0), { previewDeadlineMs: 60_000 });
+      const abort = new AbortController();
+      const first = app.fetch(new Request(previewRequest(), { signal: abort.signal }));
+
+      try {
+        await waitFor(() => launch.mock.calls.length === 1);
+        abort.abort(
+          reason === 'deadline'
+            ? new PreviewTimeoutError('Preview exceeded the deadline')
+            : new Error('client disconnected'),
+        );
+        // Let the abort unwind before submitting the burst. No browser has returned yet.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        for (let i = 0; i < 3; i += 1) {
+          const rejected = await app.fetch(previewRequest(previewPayload(), `burst-${i}`));
+          expect(rejected.status).toBe(429);
+          await expect(rejected.json()).resolves.toMatchObject({ reason: 'capacity_busy' });
+        }
+        expect(launch).toHaveBeenCalledOnce();
+
+        launching.resolve(browser);
+        await waitFor(() => close.mock.calls.length === 1);
+        const duringCleanup = await app.fetch(previewRequest());
+        expect(duringCleanup.status).toBe(429);
+        await expect(duringCleanup.json()).resolves.toMatchObject({ reason: 'capacity_busy' });
+        expect(kill).toHaveBeenCalledWith('SIGKILL');
+      } finally {
+        launching.resolve(browser);
+        closing.resolve();
+        await first;
+      }
+      expect((await first).status).toBe(reason === 'deadline' ? 504 : 500);
+
+      // A later launch failure proves the slot became available after cleanup.
+      launch.mockRejectedValueOnce(new Error('next launch reached'));
+      const next = await app.fetch(previewRequest());
+      expect(next.status).toBe(500);
+      await expect(next.json()).resolves.toEqual({ error: 'next launch reached' });
+    },
+  );
+
   it('rejects resource mode before parsing the request or starting Chromium', async () => {
     const render = vi.fn<PreviewRenderer['render']>();
     const response = await appWith({ render }, undefined, {
@@ -554,8 +617,9 @@ describe('POST /preview', () => {
     const jobs = createMemoryJobStore();
     const artifacts = createMemoryArtifactStore().store;
     const coordinator = new RenderCoordinator(executor, jobs, artifacts, { maxConcurrency: 1 });
-    const videoId = await coordinator.submit(
-      coordinator.reserve('video-user'),
+    const videoId = await submitRender(
+      coordinator,
+      'video-user',
       '/tmp/openmaic-preview-route-video-test',
       { fps: 30, quality: 'standard', format: 'mp4' },
     );
@@ -628,8 +692,9 @@ describe('POST /preview', () => {
         expect(response.status).toBe(429);
         await expect(response.json()).resolves.toMatchObject({ reason: 'capacity_busy' });
       }
-      const videoId = await coordinator.submit(
-        coordinator.reserve('video-user'),
+      const videoId = await submitRender(
+        coordinator,
+        'video-user',
         '/tmp/openmaic-preview-burst-video-test',
         { fps: 30, quality: 'standard', format: 'mp4' },
       );

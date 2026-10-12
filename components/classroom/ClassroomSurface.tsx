@@ -48,6 +48,7 @@ import { useClassroomSession } from '@/lib/classroom/use-classroom-session';
 import { applySceneDeepLink } from '@/lib/classroom/scene-deep-link';
 import { NarrationWarning } from './NarrationWarning';
 import { useRunCourse } from '@/lib/generation-run-client/use-run-course';
+import { pendingSceneFailureKey } from '@/lib/generation-run-client/failure-message';
 import { CourseGeneratingPlaceholder } from './CourseGeneratingPlaceholder';
 
 const log = createLogger('Classroom');
@@ -279,6 +280,10 @@ export function ClassroomSurface({
   // A course a server-side generation run produces: the classroom follows the
   // run (its scenes, media and pauses) and sends it Retry.
   const runCourse = useRunCourse({ classroomId, ready: !loading && !error });
+  // The pending scene's failure card shows the first outline not yet produced;
+  // the run's guidance belongs there only when that is the scene it stopped at.
+  const pendingOutlineId = useStageStore((s) => s.generatingOutlines[0]?.id);
+  const failureKey = pendingSceneFailureKey(runCourse.failure, pendingOutlineId);
 
   const view = resolveClassroomSurfaceView({
     variant,
@@ -374,6 +379,7 @@ export function ClassroomSurface({
               {mayGenerate && <NarrationWarning count={runCourse.narrationUnvoiced} />}
               <Stage
                 classroomId={classroomId}
+                generationFailureMessage={failureKey ? t(failureKey) : undefined}
                 onRetryOutline={mayGenerate && runCourse.runId ? runCourse.retryOutline : undefined}
               />
             </>

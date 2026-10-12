@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.0-rc.2] - 2026-10-11
+
+### Security
+
+- Enforce model authorization for server-managed providers across chat, media, speech, model-based web search and workspace model assignments. Unauthorized and unknown model ids return the same HTTP 403 response before provider access. Users' own credentials continue to work. [#1879](https://github.com/THU-MAIC/OpenMAIC/pull/1879) (with @13ob0)
+- Render jobs are bound to the requesting owner. The render-service and app must be upgraded together; upgrade every service instance (or drain old instances) together with or before the app. Old/new version mixes fail closed through a dedicated owner-bound job namespace. [#1884](https://github.com/THU-MAIC/OpenMAIC/pull/1884) (by @Duang777)
+- Deleted courses no longer serve their legacy classroom media: `/api/classroom-media/<id>/...` checks the course lifecycle before touching the filesystem and answers a tombstoned course with the same 404 as a missing file. Successful responses are `private, max-age=300, must-revalidate` instead of `public, immutable`. [#1883](https://github.com/THU-MAIC/OpenMAIC/pull/1883) (by @Duang777)
+
+### Breaking change: server-managed model authorization
+
+- Set `*_MODELS` for every provider with server-managed credentials, or set `models` under each provider in `openmaic.yml` / `server-providers.yml`. Without a list, only deployment default/fallback and capability slot references authorize models; preset catalogues and workspace assignments do not. Provider-only media slots authorize a single adapter default. Services without model ids need no list. Providers configured without credentials (local Ollama, Lemonade) are not restricted; a keyless gateway that adds its own upstream credential should be given a key and a model list.
+- Migration: list the model ids users should be able to select (including voice compatibility models), restart the server, then update workspace selections that are no longer authorized. A startup warning names the configuration setting for each provider with credentials but no explicit list.
+
+### Bug Fixes
+
+- S3 asset storage: `@openmaic/storage` 0.37.3 supports path-style addressing for S3-compatible object stores such as MinIO and Ceph. Set `AWS_S3_FORCE_PATH_STYLE=true` (or `1`) together with `AWS_ENDPOINT_URL_S3` so objects are addressed as `endpoint/bucket/key`; leaving it unset keeps the existing behaviour for Amazon S3 (#1686).
+- Server persistence: `@openmaic/storage` 0.37.2 bounds `HttpDocumentStore` requests with a deadline (`requestTimeoutMs`, default 30s, `<= 0` disables) covering the request round trip — sending the body and receiving the response headers — so a persistence endpoint that stops answering fails like any other transport error instead of holding its caller forever. The stage autosave keeps at most one save in flight and starts the next only once that promise settles, so a request that never settled silently stranded every later save for the life of the page while the editor went on rendering the in-memory document; the reload showed what had actually reached the server. A request aborted at the deadline rejects with `HTTP_REQUEST_TIMEOUT`, which the autosave's existing backoff retries. The budget is the floor plus an allowance proportional to the request body (sized at a fixed 100 KiB/s) and is capped at 10 minutes, so a large document on a slow link is not mistaken for a stall; reading the response body stays outside the bound. This mirrors the budget `HttpAssetStore` already applies through `probeTimeoutMs` / `startBoundedOperation`.
+- Synchronous scene previews and video exports no longer block each other; each uses its own execution lane. [#1830](https://github.com/THU-MAIC/OpenMAIC/pull/1830)
+- Preview concurrency is capped by the render resource profile and reported by `/health`. Cancelling a preview during Chromium startup retains its execution slot until launch and browser cleanup settle.
+
 ## [1.2.0-rc.1] - 2026-10-04
 
 The release candidate for 1.2.0, **server-first**.
@@ -188,7 +208,6 @@ Design: RFC [#1754](https://github.com/THU-MAIC/OpenMAIC/discussions/1754) (rele
 - Startup: a configuration refused by the boot validation in `instrumentation.ts` (a malformed `ASSET_QUOTA_BYTES`, `ASSET_PENDING_TTL_MS`, `OWNER_WRITE_LOCK_WAIT_MS` or `OWNER_CLAIM_LOCK_WAIT_MS`; an `OWNER_CLAIM_TRIGGER` other than `explicit` / `auto`; the removed `OWNER_AUTHENTICATOR` / `TRUSTED_PROXY_*` variables; a malformed `PERSISTENCE_SHARED_OWNER_ID`, one without `ACCESS_CODE` or beside a registration that leaves out `sharedTeamAuthMethod()`, or `sharedTeamAuthMethod()` registered without it or not last; `ASSET_S3_BUCKET` beside a registered asset byte store, or `ASSET_BYTE_EGRESS=redirect` with a byte store that does not declare `signsReadUrls`) now exits the Node.js server with code `1` after one `[boot] Invalid server configuration` line carrying the original message. Any other boot failure (a module missing from the build, a host registration call that throws) also exits with code `1`, printed as `[boot] Server startup failed` with its stack. Previously the server logged "Failed to prepare server", kept listening, and answered every request with `500`. Warnings never stop the server.
 - Server persistence: two concurrent creates of one new course id by the same owner no longer refuse the second as `reserved-document`: creates of one id take turns, and the second saves as an update without running the create hooks again.
 - Server persistence: instances starting at the same time against one database no longer fail schema setup on a catalog race (`duplicate key value violates unique constraint "pg_class_relname_nsp_index"` / `pg_type_typname_nsp_index`, `tuple concurrently updated`), which made an instance's first request answer `500`. Every schema bootstrap (documents, `stage_meta` and its ownership backfill, owner materials, assets, runtime, agent sessions, session materials, user skills, and the asset collector's) now runs under one PostgreSQL advisory lock held on a dedicated connection.
-
 #### Security
 
 - Server persistence: operations on one owner-bound document store no longer share mutable state, so concurrent calls on a store an agent run shares with its tools each gate their own stage; `create_stage` also runs sequentially within a tool batch.

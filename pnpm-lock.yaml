@@ -209,6 +209,9 @@ importers:
       graphemer:
         specifier: 1.4.0
         version: 1.4.0
+      htmlparser2:
+        specifier: ^8.0.2
+        version: 8.0.2
       i18next:
         specifier: ^26.0.1
         version: 26.0.1(typescript@5.9.3)
