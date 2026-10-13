@@ -1,7 +1,7 @@
 import type { Action } from '@/lib/types/action';
 import type { Scene } from '@/lib/types/stage';
 import type { SceneOutline } from '@/lib/types/generation';
-import { ELEMENT_BOUND } from '@/components/edit/ActionsBar/cue-meta';
+import { collectActionContentIssues } from '@openmaic/dsl';
 
 /**
  * Pure content-validity checks for the editor. These surface *meaningless* edit
@@ -33,17 +33,16 @@ const isBlank = (s: string | undefined): boolean => !s || s.trim() === '';
  * the ActionsBar clips.
  */
 export function validateActions(actions: Action[]): ActionIssue[] {
-  const issues: ActionIssue[] = [];
-  for (const a of actions) {
-    if (a.type === 'speech' && isBlank((a as { text?: string }).text)) {
-      issues.push({ kind: 'emptySpeech', actionId: a.id });
-    } else if (ELEMENT_BOUND.has(a.type) && isBlank((a as { elementId?: string }).elementId)) {
-      issues.push({ kind: 'unboundCue', actionId: a.id });
-    } else if (a.type === 'discussion' && isBlank((a as { topic?: string }).topic)) {
-      issues.push({ kind: 'emptyDiscussion', actionId: a.id });
-    }
-  }
-  return issues;
+  return collectActionContentIssues('', actions).map((issue) => ({
+    kind: (
+      {
+        'empty-speech': 'emptySpeech',
+        'unbound-cue': 'unboundCue',
+        'empty-discussion': 'emptyDiscussion',
+      } as const
+    )[issue.kind],
+    actionId: issue.actionId,
+  }));
 }
 
 /** All content-validity issues on a scene, in action order (empty list first). */

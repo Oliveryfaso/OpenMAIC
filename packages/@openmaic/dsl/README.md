@@ -365,3 +365,25 @@ pnpm --filter @openmaic/dsl test
 MIT, matching the rest of the family (`@openmaic/dsl`, `@openmaic/importer`,
 `@openmaic/renderer`) and the OpenMAIC root, so the license policy is uniform
 across the SDK.
+
+### Current course issues
+
+`collectCourseIssues({ scenes }, context?)` is a pure, read-only inspection of the
+current course. It reports `speech-without-audio`, `media-not-generated`,
+`dangling-cue`, and the existing empty-action/speech/discussion and unbound-cue
+lint. Each issue identifies its scene and, when applicable, its action or
+slide element. Recompute after edits: there is no persisted issue list to clear.
+Generation placeholders are errors; missing narration, dangling cues and content
+lint are warnings. This is separate from structural `validateScene` validation.
+
+A valid speech `audioId` or non-invalidated legacy `audioUrl` counts as audio.
+The browser can provide `context.hasLegacyAudio(scene, action)` using its legacy
+cache resolver. Without browser evidence, missing audio remains a warning with
+an explicit “possibly local audio” detail. Invalidated audio never uses that
+fallback. These checks inspect references, not asset availability or provider
+health.
+
+Phase 1 of RFC #1899 deliberately adds no persisted silence marker: current
+course documents cannot distinguish deliberately silent speech from missing
+narration. Such speech is a warning pending the RFC decision. Runtime failures,
+run-derived reasons, the issues list and agent repair entry point are later phases.
