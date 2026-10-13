@@ -4,6 +4,7 @@ import { act, createElement } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, expect, it } from 'vitest';
 import { db } from '@/lib/device-storage/database';
+import { observeLegacySpeechAudio } from '@/lib/device-storage/observe-legacy-speech-audio';
 import { useSceneIssues } from '@/lib/edit/use-scene-issues';
 import type { Scene } from '@/lib/types/stage';
 
@@ -49,9 +50,23 @@ it('updates from current document and live legacy audio writes/deletes', async (
   await act(async () => {
     await db.audioFiles.put({
       id: 'tts_s1_a',
+      stageId: 'other',
+      text: 'Hello',
       blob: new Blob(['audio']),
+      format: 'mp3',
       createdAt: Date.now(),
-    } as never);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+  expect(host.textContent).toContain('speech-without-audio');
+  await act(async () => {
+    await db.audioFiles.put({
+      id: 'tts_s1_a',
+      stageId: 'c',
+      blob: new Blob(['audio']),
+      format: 'mp3',
+      createdAt: Date.now(),
+    });
     await new Promise((resolve) => setTimeout(resolve, 50));
   });
   expect(host.textContent).toBe('');
@@ -63,3 +78,49 @@ it('updates from current document and live legacy audio writes/deletes', async (
   await act(async () => root.render(createElement(Probe, { scene: scene('allocated-audio') })));
   expect(host.textContent).toBe('');
 });
+
+it.each([
+  { name: 'another course, even with matching text', stageId: 'other', text: 'Hello', have: false },
+  { name: 'the current course', stageId: 'c', text: 'Hello', have: true },
+  { name: 'an unscoped row with different text', text: 'Other narration', have: false },
+  { name: 'an unscoped row with matching text', text: ' Hello ', have: true },
+  { name: 'an ambiguous row without ownership metadata', have: false },
+  { name: 'a pre-allocation generated action', actionId: 'action_abcdefgh', have: true },
+  { name: 'an empty action ID', stageId: 'c', actionId: '', have: false },
+  { name: 'an invalidated action', stageId: 'c', audioInvalidated: true, have: false },
+  {
+    name: 'an action with a current audio reference',
+    stageId: 'c',
+    audioId: 'allocated',
+    have: false,
+  },
+])(
+  'checks legacy cache ownership for $name',
+  async ({ stageId, text, actionId = 'a', audioInvalidated, audioId, have }) => {
+    const s = scene();
+    s.actions![0].id = actionId;
+    Object.assign(s.actions![0], { audioInvalidated, audioId });
+    await db.audioFiles.put({
+      id: `tts_s1_${actionId}`,
+      stageId,
+      text,
+      blob: new Blob(['audio']),
+      format: 'mp3',
+      createdAt: Date.now(),
+    });
+    const audio = await new Promise<Set<string>>((resolve, reject) => {
+      const stop = observeLegacySpeechAudio(
+        s,
+        (ids) => {
+          stop();
+          resolve(ids);
+        },
+        () => {
+          stop();
+          reject(new Error('Legacy cache observation failed'));
+        },
+      );
+    });
+    expect(audio.has(actionId)).toBe(have);
+  },
+);
