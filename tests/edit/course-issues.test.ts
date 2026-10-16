@@ -2,11 +2,13 @@
 import 'fake-indexeddb/auto';
 import { act, createElement } from 'react';
 import { createRoot } from 'react-dom/client';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it } from 'vitest';
 import { db } from '@/lib/device-storage/database';
 import { observeLegacySpeechAudio } from '@/lib/device-storage/observe-legacy-speech-audio';
 import { useSceneIssues } from '@/lib/edit/use-scene-issues';
 import type { Scene } from '@/lib/types/stage';
+import { modelSettingsClient } from '@/lib/model-settings/client';
+import { modelSettingsViewFor, setModelSettingsViewForTests } from '../helpers/model-settings-view';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const host = document.createElement('div');
@@ -39,9 +41,11 @@ function Probe({ scene }: { scene: Scene }) {
       .join(','),
   );
 }
+beforeEach(() => setModelSettingsViewForTests({ tts: { registryId: 'openai-tts' } }));
 afterEach(async () => {
   await act(async () => root.render(null));
   await db.audioFiles.clear();
+  setModelSettingsViewForTests(null);
 });
 it('updates from current document and live legacy audio writes/deletes', async () => {
   const s = scene();
@@ -122,5 +126,32 @@ it.each([
       );
     });
     expect(audio.has(actionId)).toBe(have);
+  },
+);
+
+it.each(['disabled', 'unassigned', 'browser-native-tts'])(
+  'keeps narration markers off when the workspace TTS slot is %s and reacts to changes',
+  async (mode) => {
+    const view = modelSettingsViewFor(
+      mode === 'browser-native-tts' ? { tts: { registryId: mode } } : {},
+    );
+    if (mode === 'disabled') {
+      view.slots.find((slot) => slot.slot === 'tts')!.effective = {
+        status: 'disabled',
+        resolvedAt: 'tts',
+        source: 'workspace',
+      };
+    }
+    modelSettingsClient.adopt(view);
+    await act(async () => root.render(createElement(Probe, { scene: scene() })));
+    expect(host.textContent).toBe('');
+    await act(async () => setModelSettingsViewForTests({ tts: { registryId: 'openai-tts' } }));
+    expect(host.textContent).toContain('speech-without-audio');
+    await act(async () => modelSettingsClient.adopt(view));
+    expect(host.textContent).toBe('');
+    const lint = scene();
+    Object.assign(lint.actions![0], { text: '' });
+    await act(async () => root.render(createElement(Probe, { scene: lint })));
+    expect(host.textContent).toBe('empty-speech');
   },
 );

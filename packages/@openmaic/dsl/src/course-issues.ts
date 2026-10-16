@@ -14,14 +14,16 @@ export type CourseIssueKind =
   | 'empty-discussion';
 
 export interface CourseIssue {
+  /** Opaque identity derived from kind and document target; stable across recomputation. */
+  id: string;
   kind: CourseIssueKind;
   sceneId: string;
   elementId?: string;
   actionId?: string;
   severity: 'error' | 'warning';
   source: 'document' | 'run' | 'runtime';
-  /** Bounded evidence, never instructions. */
-  detail?: string;
+  /** Device-local evidence has not been checked for an eligible legacy action. */
+  evidence?: 'local-audio-unchecked';
 }
 
 /** Structural view shared by the app's extended scenes and SDK documents. */
@@ -30,6 +32,8 @@ export type CourseIssueScene = SceneCore & {
 };
 
 export interface CourseIssueContext {
+  /** False when the workspace cannot generate narration; defaults to inspecting it. */
+  narrationEnabled?: boolean;
   /** Browser evidence for an unstamped legacy action; undefined means unknown. */
   hasLegacyAudio?: (scene: CourseIssueScene, action: SpeechAction) => boolean | undefined;
 }
@@ -40,8 +44,15 @@ export const ELEMENT_BOUND_CUE_TYPES: ReadonlySet<string> = new Set([
   'play_video',
 ]);
 const blank = (value: string | undefined) => !value?.trim();
+const issueId = (
+  kind: CourseIssueKind,
+  sceneId: string,
+  actionId?: string,
+  elementId?: string,
+  slideId?: string,
+) => JSON.stringify([kind, sceneId, actionId, elementId, slideId]);
 
-export type ActionContentIssue = CourseIssue & {
+type ActionContentIssue = CourseIssue & {
   kind: 'empty-speech' | 'unbound-cue' | 'empty-discussion';
   actionId: string;
 };
@@ -52,7 +63,7 @@ export function isGeneratedMediaPlaceholder(value: string | undefined): value is
 }
 
 /** Existing timeline lint, shared with the course collector. */
-export function collectActionContentIssues(
+function collectActionContentIssues(
   sceneId: string,
   actions: readonly Action[],
 ): ActionContentIssue[] {
@@ -67,7 +78,14 @@ export function collectActionContentIssues(
       kind = 'unbound-cue';
     else if (action.type === 'discussion' && blank(action.topic)) kind = 'empty-discussion';
     if (kind)
-      issues.push({ kind, sceneId, actionId: action.id, severity: 'warning', source: 'document' });
+      issues.push({
+        id: issueId(kind, sceneId, action.id),
+        kind,
+        sceneId,
+        actionId: action.id,
+        severity: 'warning',
+        source: 'document',
+      });
   }
   return issues;
 }
@@ -80,22 +98,35 @@ export function collectCourseIssues(
   const issues: CourseIssue[] = [];
   for (const scene of document.scenes) {
     const actions = scene.actions ?? [];
-    const add = (kind: CourseIssueKind, fields: Partial<CourseIssue> = {}) =>
-      issues.push({ kind, sceneId: scene.id, severity: 'warning', source: 'document', ...fields });
+    const add = (kind: CourseIssueKind, fields: Partial<CourseIssue> = {}, slideId?: string) =>
+      issues.push({
+        id: issueId(kind, scene.id, fields.actionId, fields.elementId, slideId),
+        kind,
+        sceneId: scene.id,
+        severity: 'warning',
+        source: 'document',
+        ...fields,
+      });
     if (!actions.length) add('empty-actions');
     issues.push(...collectActionContentIssues(scene.id, actions));
     const canvas = isSlideContent(scene.content) ? scene.content.canvas : undefined;
     const targets = new Map((canvas?.elements ?? []).map((element) => [element.id, element.type]));
     for (const action of actions) {
-      if (action.type === 'speech' && !blank(action.text) && blank(action.audioId)) {
+      if (
+        action.type === 'speech' &&
+        !blank(action.text) &&
+        blank(action.audioId) &&
+        context.narrationEnabled !== false
+      ) {
         const legacyUrl = (action as SpeechAction & { audioUrl?: string }).audioUrl;
-        const legacy = action.audioInvalidated ? false : context.hasLegacyAudio?.(scene, action);
+        const legacy =
+          action.audioInvalidated || blank(action.id)
+            ? false
+            : context.hasLegacyAudio?.(scene, action);
         if ((!action.audioInvalidated && !blank(legacyUrl)) || legacy === true) continue;
         add('speech-without-audio', {
           actionId: action.id,
-          ...(legacy === undefined
-            ? { detail: 'Possibly local audio: browser legacy audio has not been checked.' }
-            : {}),
+          ...(legacy === undefined ? { evidence: 'local-audio-unchecked' as const } : {}),
         });
       } else if (ELEMENT_BOUND_CUE_TYPES.has(action.type)) {
         const elementId = (action as { elementId?: string }).elementId;
@@ -124,12 +155,15 @@ export function collectCourseIssues(
           if (!isGeneratedMediaPlaceholder(source)) continue;
         }
         reported.add(slot.elementIndex);
-        add('media-not-generated', {
-          severity: 'error',
-          ...(slot.elementIndex === undefined
-            ? {}
-            : { elementId: slide.elements[slot.elementIndex].id }),
-        });
+        add(
+          'media-not-generated',
+          {
+            ...(slot.elementIndex === undefined
+              ? {}
+              : { elementId: slide.elements[slot.elementIndex].id }),
+          },
+          slide.id,
+        );
       }
     }
   }
