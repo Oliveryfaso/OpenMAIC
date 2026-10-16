@@ -58,6 +58,7 @@ describe('settingsShape', () => {
         'tts',
         'asr',
         'document',
+        'webFetch',
         'webSearch',
       ]);
     }
@@ -127,10 +128,10 @@ describe('a mixed deployment (llm locked, user keys allowed)', () => {
     expect(settingsSections(view).modelServices).toContain('image');
   });
 
-  it('keeps a plan that can still fill media slots, and drops one that only serves chat', () => {
+  it('keeps plans that can still fill media or search slots', () => {
     const view = viewFor(config);
     expect(tokenPlanCanChange(view, plan(view, 'tokendance'))).toBe(true);
-    expect(tokenPlanCanChange(view, plan(view, 'kimi-coding-plan'))).toBe(false);
+    expect(tokenPlanCanChange(view, plan(view, 'kimi-coding-plan'))).toBe(true);
     expect(settingsSections(view).tokenPlan).toBe(true);
   });
 

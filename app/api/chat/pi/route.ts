@@ -7,6 +7,7 @@
  */
 import { attachInteractiveState } from '@/lib/chat/pi/interactive-state-evidence';
 import { ModelAuthorizationError } from '@/lib/server/model-config/model-authorization';
+import { PiGeminiNativeRequiredError } from '@/lib/server/model-config/pi-gemini-route';
 import { SlotRequirementError } from '@/lib/server/model-config/llm';
 
 import { NextRequest } from 'next/server';
@@ -98,6 +99,19 @@ async function chat(req: NextRequest, principal: OwnerPrincipal): Promise<Respon
       !isCoursewareReferenceEnabled()
     ) {
       return apiError('INVALID_REQUEST', 400, 'Courseware references are disabled');
+    }
+
+    // Non-object members (null, primitives, arrays) are never valid scenes and
+    // null throws on scene.id / scene.order in reference lookup and later scene
+    // iteration. Rejecting them once here covers every path before reference
+    // resolution and model resolution.
+    if (
+      Array.isArray(body.storeState.scenes) &&
+      body.storeState.scenes.some(
+        (scene) => typeof scene !== 'object' || scene === null || Array.isArray(scene),
+      )
+    ) {
+      return apiError('INVALID_REQUEST', 400, 'storeState.scenes members must be objects');
     }
 
     let elementReference;
@@ -355,6 +369,15 @@ async function chat(req: NextRequest, principal: OwnerPrincipal): Promise<Respon
       },
     });
   } catch (error) {
+    if (error instanceof PiGeminiNativeRequiredError) {
+      return apiError(
+        'MODEL_CONFIG_INVALID',
+        400,
+        error.message,
+        undefined,
+        'gemini_native_required',
+      );
+    }
     if (error instanceof SlotRequirementError) {
       return apiError(
         'MODEL_CONFIG_INVALID',
