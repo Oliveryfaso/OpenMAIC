@@ -111,6 +111,7 @@ const MODALITY_CAPABILITY: Record<TokenPlanModality, SlotCapability> = {
   video: 'video',
   tts: 'tts',
   webSearch: 'webSearch',
+  webFetch: 'webFetch',
 };
 
 function singlePresets(): ProviderPreset[] {
@@ -165,7 +166,7 @@ export function tokenPlanToPreset(plan: TokenPlanPreset): ProviderPreset {
     };
     const root = capability === 'chat' ? 'llm' : capability;
     if (lead) recommended[root as SlotId] = lead;
-    // A capability without models to pick (web search) is served by the
+    // A capability without models to pick (web search or fetch) is served by the
     // provider alone: the recommendation names its registry entry, which
     // becomes a provider-only assignment.
     else if (!target.defaultModels?.length) recommended[root as SlotId] = target.providerId;
@@ -179,6 +180,18 @@ export function tokenPlanToPreset(plan: TokenPlanPreset): ProviderPreset {
 
 // These accounts share one key and base URL across capability registries.
 const SHARED_ACCOUNT_PRESETS: ProviderPreset[] = [
+  {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    kind: 'single',
+    capabilities: { chat: { registryId: 'deepseek' }, webSearch: { registryId: 'deepseek' } },
+  },
+  {
+    id: 'firecrawl',
+    name: 'Firecrawl',
+    kind: 'single',
+    capabilities: { webSearch: { registryId: 'firecrawl' }, webFetch: { registryId: 'firecrawl' } },
+  },
   {
     id: 'kimi',
     name: 'Kimi',
@@ -201,6 +214,7 @@ function buildPresets(): ProviderPreset[] {
     for (const preset of presets.filter((entry) =>
       provider.credentialPresets?.includes(entry.id),
     )) {
+      if (preset.capabilities.webFetch) continue;
       preset.capabilities.webFetch = {
         registryId: provider.id,
         baseUrl: preset.capabilities.chat?.baseUrl,
